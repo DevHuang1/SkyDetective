@@ -10,6 +10,11 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import SpherexComparison from "./spherex-comparison";
+import SavedPositions from "./saved-positions";
+import ObjectSearch from "./object-search";
+import AreaBrowser from "./area-browser";
+import ResearchTools from "./research-tools";
+import { parseSharedView } from "./sky-data";
 import {
   DEMO_CENTER,
   DEMO_FIELD_OF_VIEW_DEG,
@@ -225,6 +230,14 @@ export default function SkyViewport({
   const [localStarfieldRequested, setLocalStarfieldRequested] = useState(false);
   const [selectedFootprintId, setSelectedFootprintId] = useState<string | null>(null);
   const [gridVisible, setGridVisible] = useState(true);
+  const [showNavigator, setShowNavigator] = useState(false);
+  const [showSavedPositions, setShowSavedPositions] = useState(false);
+  const [showObjectSearch, setShowObjectSearch] = useState(false);
+  const [showAreas, setShowAreas] = useState(false);
+  const [showResearch, setShowResearch] = useState(false);
+  const initialSharedViewRef = useRef<ReturnType<typeof parseSharedView>>(null);
+  const [navigationError, setNavigationError] = useState("");
+  const [navigationTarget, setNavigationTarget] = useState({ ra: "", dec: "", fov: "" });
   const [view, setView] = useState<SkyViewState>(() => ({
     center: requestedCenter,
     fieldOfViewDeg: requestedFov,
@@ -259,6 +272,12 @@ export default function SkyViewport({
         // Storage can be unavailable in private browsing contexts.
       }
       if (cancelled) return;
+      const sharedView = parseSharedView(window.location.search);
+      initialSharedViewRef.current = sharedView;
+      if (sharedView && !hasControlledCenter) {
+        setView(sharedView);
+        savedSurvey = sharedView.survey;
+      }
 
       if (savedSurvey === "optical" || savedSurvey === "infrared") {
         setSurveyChoice(savedSurvey);
@@ -273,7 +292,13 @@ export default function SkyViewport({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hasControlledCenter]);
+
+  useEffect(() => {
+    if (mapStatus !== "loading") return;
+    const timer = setTimeout(() => setMapStatus((status) => status === "loading" ? "fallback" : status), 20000);
+    return () => clearTimeout(timer);
+  }, [mapStatus]);
 
   const updateViewFromMap = useCallback((map: AladinInstance) => {
     const [raDeg, decDeg] = map.getRaDec();
@@ -318,12 +343,14 @@ export default function SkyViewport({
         await api.init;
         if (cancelled) return;
 
+        const sharedView = !hasControlledCenter ? initialSharedViewRef.current : null;
+        const initialCenter = sharedView?.center ?? requestedCenter;
         activeMap = api.aladin(mapHost, {
-          target: `${requestedCenter.raDeg} ${requestedCenter.decDeg}`,
+          target: `${initialCenter.raDeg} ${initialCenter.decDeg}`,
           survey: SURVEYS[surveyChoice].id,
           cooFrame: "ICRSd",
           projection: "TAN",
-          fov: requestedFov,
+          fov: fieldOfViewDeg === undefined ? sharedView?.fieldOfViewDeg ?? requestedFov : requestedFov,
           mode: "dark",
           inertia: true,
           showZoomControl: false,
@@ -445,6 +472,17 @@ export default function SkyViewport({
     if (hasControlledCenter) map.gotoRaDec(requestedCenter.raDeg, requestedCenter.decDeg);
     if (fieldOfViewDeg !== undefined) map.setFoV(requestedFov);
   }, [fieldOfViewDeg, hasControlledCenter, mapStatus, requestedCenter.decDeg, requestedCenter.raDeg, requestedFov]);
+
+  useEffect(() => {
+    const closePanels = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setShowNavigator(false); setShowSavedPositions(false); setShowObjectSearch(false); setShowAreas(false); setShowResearch(false); setShowSurveyPicker(false);
+      selectedFootprintIdRef.current = null;
+      setSelectedFootprintId(null);
+    };
+    window.addEventListener("keydown", closePanels);
+    return () => window.removeEventListener("keydown", closePanels);
+  }, []);
 
   const handleSurveyChange = useCallback((nextSurvey: SurveyId) => {
     setSurveyChoice(nextSurvey);
@@ -622,9 +660,19 @@ export default function SkyViewport({
             <button
               className={styles.compareButton}
               type="button"
+              aria-label="Compare demo observations across dates"
+              title="Compare demo observations across dates"
               onClick={() => {
                 const demoFootprint = footprints.find((footprint) => footprint.id === DEMO_FOOTPRINT_ID);
-                if (demoFootprint) selectFootprint(demoFootprint.id);
+                if (demoFootprint) {
+                  const map = mapRef.current;
+                  if (map) {
+                    map.gotoRaDec(DEMO_CENTER.raDeg, DEMO_CENTER.decDeg);
+                    map.setFoV(DEMO_FIELD_OF_VIEW_DEG);
+                    updateViewFromMap(map);
+                  }
+                  selectFootprint(demoFootprint.id);
+                }
               }}
               disabled={!footprints.some((footprint) => footprint.id === DEMO_FOOTPRINT_ID)}
             >
@@ -667,6 +715,26 @@ export default function SkyViewport({
 
         <nav className={styles.controlDock} aria-label="Sky map controls">
           <span className={styles.controlLabel}>NAVIGATE</span>
+          <button
+            type="button"
+            aria-label="Go to sky coordinates"
+            title="Go to sky coordinates"
+            aria-expanded={showNavigator}
+            aria-controls="coordinate-navigator"
+            disabled={mapControlsDisabled}
+            onClick={() => {
+              setNavigationTarget({ ra: String(view.center.raDeg), dec: String(view.center.decDeg), fov: String(view.fieldOfViewDeg) });
+              setNavigationError("");
+              setShowNavigator((visible) => !visible);
+              setShowSavedPositions(false);
+              setShowObjectSearch(false);
+          setShowAreas(false);
+          setShowResearch(false);
+              setShowSurveyPicker(false);
+            }}
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="5" /><path d="M10 2v5m0 6v5M2 10h5m6 0h5" /></svg>
+          </button>
           <button type="button" aria-label="Zoom in" title="Zoom in" disabled={mapControlsDisabled} onClick={() => mapRef.current?.increaseZoom()}>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
           </button>
@@ -705,6 +773,120 @@ export default function SkyViewport({
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 1 0 1.7-4.2L4 7.5M4 4v3.5h3.5" /></svg>
           </button>
         </nav>
+
+        <div className={styles.exploreActions}>
+        <button type="button" aria-expanded={showObjectSearch} aria-controls="object-search" onClick={() => {
+          setShowObjectSearch((visible) => !visible);
+          setShowAreas(false); setShowResearch(false);
+          setShowSavedPositions(false);
+          setShowNavigator(false);
+          setShowSurveyPicker(false);
+        }}>⌕ Find object</button>
+        <button type="button" aria-expanded={showSavedPositions} aria-controls="saved-positions" onClick={() => {
+          setShowSavedPositions((visible) => !visible);
+          setShowAreas(false); setShowResearch(false);
+          setShowNavigator(false);
+          setShowSurveyPicker(false);
+          setShowObjectSearch(false);
+        }}>☆ Saved positions</button>
+        <button type="button" aria-expanded={showAreas} aria-controls="area-browser" onClick={() => {
+          setShowAreas((visible) => !visible);
+          setShowResearch(false); setShowNavigator(false); setShowSurveyPicker(false); setShowSavedPositions(false); setShowObjectSearch(false);
+        }}>◎ Sky areas</button>
+        <button type="button" aria-expanded={showResearch} aria-controls="research-tools" onClick={() => {
+          setShowResearch((visible) => !visible);
+          setShowAreas(false); setShowNavigator(false); setShowSurveyPicker(false); setShowSavedPositions(false); setShowObjectSearch(false);
+        }}>↗ Research & help</button>
+        </div>
+
+        {showAreas && <AreaBrowser disabled={mapControlsDisabled} onClose={() => setShowAreas(false)} onVisit={(position) => {
+          const map = mapRef.current;
+          if (!map || mapControlsDisabled) return;
+          map.gotoRaDec(position.center.raDeg, position.center.decDeg);
+          map.setFoV(position.fieldOfViewDeg);
+          updateViewFromMap(map);
+          scheduleViewSettled(map);
+          setShowAreas(false);
+          selectedFootprintIdRef.current = null;
+          setSelectedFootprintId(null);
+          mapHostRef.current?.focus();
+        }} />}
+        {showResearch && <ResearchTools getView={() => view} survey={surveyChoice} disabled={mapControlsDisabled} onClose={() => setShowResearch(false)} />}
+
+        {showObjectSearch && <ObjectSearch disabled={mapControlsDisabled} onClose={() => setShowObjectSearch(false)} onVisit={(center) => {
+          const map = mapRef.current;
+          if (!map || mapControlsDisabled) return;
+          map.gotoRaDec(center.raDeg, center.decDeg);
+          map.setFoV(2);
+          updateViewFromMap(map);
+          scheduleViewSettled(map);
+          setShowObjectSearch(false);
+          setShowAreas(false);
+          setShowResearch(false);
+          mapHostRef.current?.focus();
+        }} />}
+
+        {showSavedPositions && <SavedPositions
+          getView={() => mapRef.current ? updateViewFromMap(mapRef.current) : view}
+          survey={surveyChoice}
+          disabled={mapControlsDisabled}
+          onClose={() => setShowSavedPositions(false)}
+          onVisit={(position) => {
+            const map = mapRef.current;
+            if (!map || mapControlsDisabled) return;
+            handleSurveyChange(position.survey);
+            map.gotoRaDec(position.center.raDeg, position.center.decDeg);
+            map.setFoV(position.fieldOfViewDeg);
+            updateViewFromMap(map);
+            scheduleViewSettled(map);
+            setShowSavedPositions(false);
+            mapHostRef.current?.focus();
+          }}
+        />}
+
+        {showNavigator && (
+          <section id="coordinate-navigator" className={styles.navigator} aria-label="Go to sky coordinates">
+            <div className={styles.navigatorHeading}>
+              <h2>Go to coordinates</h2>
+              <button type="button" aria-label="Close coordinate navigator" onClick={() => setShowNavigator(false)}>×</button>
+            </div>
+            <p>Enter ICRS coordinates in decimal degrees.</p>
+            <form onSubmit={(event) => {
+              event.preventDefault();
+              const ra = Number(navigationTarget.ra);
+              const dec = Number(navigationTarget.dec);
+              const fov = Number(navigationTarget.fov);
+              if (Object.values(navigationTarget).some((value) => !value.trim()) || !Number.isFinite(ra) || !Number.isFinite(dec) || !Number.isFinite(fov) || ra < 0 || ra >= 360 || dec < -90 || dec > 90 || fov < MIN_FIELD_OF_VIEW || fov > MAX_FIELD_OF_VIEW) {
+                setNavigationError("Use RA 0–359.999°, Dec −90–90°, and field of view 0.03–120°.");
+                return;
+              }
+              const map = mapRef.current;
+              if (!map || mapControlsDisabled) return;
+              map.gotoRaDec(ra, dec);
+              map.setFoV(fov);
+              updateViewFromMap(map);
+              scheduleViewSettled(map);
+              setShowNavigator(false);
+              mapHostRef.current?.focus();
+            }}>
+              {([
+                ["ra", "Right ascension (°)", 0, 359.999999],
+                ["dec", "Declination (°)", -90, 90],
+                ["fov", "Field of view (°)", MIN_FIELD_OF_VIEW, MAX_FIELD_OF_VIEW],
+              ] as const).map(([key, label, min, max]) => (
+                <label key={key}>{label}
+                  <input type="number" required step="any" min={min} max={max} value={navigationTarget[key]} aria-describedby={navigationError ? "navigation-error" : undefined} onChange={(event) => {
+                    setNavigationTarget((target) => ({ ...target, [key]: event.target.value }));
+                    setNavigationError("");
+                  }} />
+                </label>
+              ))}
+              {navigationError && <p id="navigation-error" role="alert">{navigationError}</p>}
+              {mapControlsDisabled && <p role="status">Return to the live atlas to navigate.</p>}
+              <button className={styles.navigatorSubmit} type="submit" disabled={mapControlsDisabled}>Go to position ↗</button>
+            </form>
+          </section>
+        )}
 
         <aside className={styles.coordinateReadout} aria-live="polite" aria-label="Current sky coordinates">
           <div className={styles.readoutHeading}>
@@ -751,7 +933,7 @@ export default function SkyViewport({
           </div>
         )}
 
-        {mapStatus !== "loading" && activeFootprintIsDemo && visibleSelectedFootprintId && (
+        {activeFootprintIsDemo && visibleSelectedFootprintId && (
           <SpherexComparison center={DEMO_CENTER} onClose={() => {
             selectedFootprintIdRef.current = null;
             setSelectedFootprintId(null);

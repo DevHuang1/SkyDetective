@@ -986,3 +986,95 @@
     transition: none;
   }
 }
+.navigator {
+  position: absolute;
+  z-index: 9;
+  top: 110px;
+  left: 28px;
+  width: min(320px, calc(100% - 40px));
+  max-height: calc(100% - 220px);
+  overflow-y: auto;
+  padding: 20px;
+  border: 1px solid #83c6d844;
+  border-radius: 16px;
+  background: #091622f5;
+  color: #e9f4fb;
+  box-shadow: 0 16px 48px #0008;
+}
+
+.navigatorHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.navigator h2 { margin: 0; font-size: 17px; }
+.navigator p { font-size: 12px; line-height: 1.6; color: #aac5d5; }
+.navigatorHeading button { background: transparent; border: 0; color: #e9f4fb; font-size: 26px; cursor: pointer; }
+.navigator form { display: grid; gap: 14px; }
+.navigator label { display: grid; gap: 6px; font-size: 12px; }
+.navigator input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #83c6d855;
+  border-radius: 7px;
+  background: #112433;
+  color: #e9f4fb;
+  font: inherit;
+}
+.navigator input:focus-visible, .navigator button:focus-visible { outline: 2px solid #67d9ee; outline-offset: 3px; }
+.navigatorSubmit { padding: 12px; border: 1px solid #67d9ee88; border-radius: 7px; background: #194151; color: #e9f4fb; font: inherit; cursor: pointer; }
+.navigatorSubmit:disabled { opacity: 0.5; cursor: default; }
+
+.exploreActions {
+  position: absolute;
+  z-index: 8;
+  top: 94px;
+  left: 28px;
+  display: flex;
+  gap: 8px;
+}
+.exploreActions button {
+  padding: 10px 14px;
+  border: 1px solid #83c6d855;
+  border-radius: 9px;
+  background: #091622ed;
+  color: #e9f4fb;
+  font-size: 12px;
+  cursor: pointer;
+}
+.exploreActions button:focus-visible { outline: 2px solid #67d9ee; outline-offset: 3px; }
+.searchResult { padding: 12px; border: 1px solid #83c6d844; border-radius: 8px; overflow-wrap: anywhere; }
+.navigator a { color: #67d9ee; }
+.savedList { display: grid; gap: 8px; padding: 0; margin: 12px 0 0; list-style: none; }
+.savedList li { display: flex; border: 1px solid #83c6d833; border-radius: 8px; overflow: hidden; }
+.savedVisit { display: grid; gap: 6px; flex: 1; min-width: 0; padding: 12px; text-align: left; background: #112433; color: #e9f4fb; border: 0; cursor: pointer; }
+.savedVisit strong { overflow-wrap: anywhere; }
+.savedVisit small { color: #aac5d5; font-size: 10px; }
+.savedVisit:disabled { opacity: 0.5; cursor: default; }
+.savedRemove { padding: 10px; background: #112433; color: #aac5d5; border: 0; font-size: 22px; cursor: pointer; }
+.navigator { top: 142px; }
+
+@media (max-width: 760px) {
+  .navigator { top: 142px; left: 20px; }
+  .exploreActions { left: 20px; }
+}
+
+.exploreActions { flex-wrap: wrap; max-width: calc(100% - 56px); }
+.toolButtons { display: grid; gap: 10px; margin: 14px 0; }
+.guideList { padding-left: 20px; color: #aac5d5; font-size: 12px; line-height: 1.7; }
+.guideList li { margin-bottom: 8px; }
+.navigator summary { color: #c6e7f0; cursor: pointer; font-size: 12px; padding: 8px 0; }
+.navigator details { border-top: 1px solid #83c6d833; margin-top: 12px; }
+.importLabel { padding: 10px; border: 1px solid #83c6d844; border-radius: 7px; }
+@media (max-width: 760px) {
+  .exploreActions { max-width: calc(100% - 40px); gap: 5px; }
+  .exploreActions button { padding: 8px 9px; font-size: 11px; }
+  .navigator { top: 175px; max-height: calc(100% - 270px); }
+}
+
+.exploreActions { max-width: min(340px, calc(100% - 40px)); }
+.navigator { top: 190px; max-height: calc(100% - 275px); }
+@media (max-width: 760px) { .navigator { top: 175px; max-height: calc(100% - 260px); } }

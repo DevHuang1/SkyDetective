@@ -4,6 +4,7 @@ export type SpherexObservation = {
   id: string;
   date: string;
   image: string;
+  sourceUrl: string;
 };
 
 export const DEMO_CENTER: SkyCoordinate = {
@@ -21,11 +22,13 @@ export const SPHEREX_DEMO_OBSERVATIONS: readonly SpherexObservation[] = [
     id: "spherex-2025-05-03",
     date: "May 03, 2025",
     image: "/spherex-previews/spherex-qr2-d1-2025-05-03.png",
+    sourceUrl: "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr2/level2/2025W18_2B/l2b-v20-2025-241/1/level2_2025W18_2B_0237_4D1_spx_l2b-v20-2025-241.fits",
   },
   {
     id: "spherex-2025-05-22",
     date: "May 22, 2025",
     image: "/spherex-previews/spherex-qr2-d1-2025-05-22.png",
+    sourceUrl: "https://irsa.ipac.caltech.edu/ibe/data/spherex/qr2/level2/2025W21_1B/l2b-v20-2025-248/1/level2_2025W21_1B_0582_2D1_spx_l2b-v20-2025-248.fits",
   },
 ];
 
