@@ -1,30 +1,25 @@
 "use client";
 
-import type {
-  Group,
-  PerspectiveCamera,
-  Scene,
-  WebGLRenderer,
-} from "three";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Script from "next/script";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import SpherexComparison from "./spherex-comparison";
+import {
+  DEMO_CENTER,
+  DEMO_FIELD_OF_VIEW_DEG,
+  DEMO_FOOTPRINT_ID,
+  DEMO_FOOTPRINTS,
+} from "./spherex-demo";
+import type { SkyCoordinate, SkyFootprint, SkyViewState } from "./sky-types";
 import styles from "./sky-viewport.module.css";
 
-export type SkyCoordinate = {
-  raDeg: number;
-  decDeg: number;
-};
-
-export type SkyFootprint = {
-  id: string;
-  vertices: readonly SkyCoordinate[];
-  selected?: boolean;
-};
-
-export type SkyViewState = {
-  center: SkyCoordinate;
-  /** Horizontal field of view, in degrees. */
-  fieldOfViewDeg: number;
-};
+export type { SkyCoordinate, SkyFootprint, SkyViewState } from "./sky-types";
 
 type SkyViewportProps = {
   viewCenter?: SkyCoordinate;
@@ -34,738 +29,565 @@ type SkyViewportProps = {
   onFootprintSelect?: (id: string) => void;
 };
 
-type ThreeModule = typeof import("three");
+type SurveyId = "optical" | "infrared";
 
-type ViewportRuntime = {
-  THREE: ThreeModule;
-  camera: PerspectiveCamera;
-  footprintGroup: Group;
-  renderer: WebGLRenderer;
-  scene: Scene;
-  resizeObserver: ResizeObserver;
+type AladinOverlay = {
+  addFootprints: (footprints: unknown | readonly unknown[]) => void;
 };
 
-const EMPTY_FOOTPRINTS: readonly SkyFootprint[] = [];
-const INITIAL_CENTER: SkyCoordinate = { raDeg: 0, decDeg: 0 };
-const INITIAL_FOV = 70;
-const MIN_FOV = 24;
-const MAX_FOV = 110;
+type AladinInstance = {
+  addOverlay: (overlay: AladinOverlay) => void;
+  decreaseZoom: () => void;
+  getFoV: () => number[];
+  getRaDec: () => number[];
+  gotoRaDec: (ra: number, dec: number) => void;
+  increaseZoom: () => void;
+  off?: (event: string) => void;
+  on: (event: string, callback: (...args: unknown[]) => void) => void;
+  pix2world: (x: number, y: number, frame?: string) => number[];
+  removeOverlay: (overlay: AladinOverlay) => void;
+  setBaseImageLayer: (surveyId: string) => void;
+  setCooGrid: (options: { enabled: boolean; color?: string; opacity?: number; thickness?: number; labelSize?: number }) => void;
+  setDefaultColor: (color: string) => void;
+  setFoV: (fov: number) => void;
+  setFoVRange: (minFoV: number, maxFoV: number) => void;
+  showReticle: (show: boolean) => void;
+  destroy?: () => void;
+};
 
-function normalizeRa(raDeg: number) {
-  return ((raDeg % 360) + 360) % 360;
+type AladinGlobal = {
+  init: Promise<void>;
+  aladin: (element: HTMLElement, options: Record<string, unknown>) => AladinInstance;
+  graphicOverlay: (options: Record<string, unknown>) => AladinOverlay;
+  footprint: (shapes: readonly unknown[], source?: unknown) => unknown;
+  polygon: (radec: readonly (readonly [number, number])[], options: Record<string, unknown>) => unknown;
+  source: (ra: number, dec: number, data?: Record<string, unknown>) => unknown;
+};
+
+declare global {
+  interface Window {
+    A?: AladinGlobal;
+  }
 }
 
+const SURVEYS: Record<SurveyId, { id: string; label: string; detail: string }> = {
+  optical: {
+    id: "P/DSS2/color",
+    label: "Optical color",
+    detail: "DSS2 · visible light",
+  },
+  infrared: {
+    id: "P/2MASS/color",
+    label: "Near-infrared",
+    detail: "2MASS · infrared",
+  },
+};
+
+const SURVEY_STORAGE_KEY = "skydetective.base-survey";
+const ALADIN_SCRIPT = "https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js";
+const MIN_FIELD_OF_VIEW = 0.03;
+const MAX_FIELD_OF_VIEW = 120;
+
 function normalizeCoordinate(coordinate: SkyCoordinate): SkyCoordinate {
+  const ra = Number.isFinite(coordinate.raDeg) ? coordinate.raDeg : 0;
+  const dec = Number.isFinite(coordinate.decDeg) ? coordinate.decDeg : 0;
   return {
-    raDeg: normalizeRa(Number.isFinite(coordinate.raDeg) ? coordinate.raDeg : 0),
-    decDeg: Math.max(-90, Math.min(90, Number.isFinite(coordinate.decDeg) ? coordinate.decDeg : 0)),
+    raDeg: ((ra % 360) + 360) % 360,
+    decDeg: Math.max(-90, Math.min(90, dec)),
   };
 }
 
-function formatCoordinate(value: number, suffix: string) {
-  const sign = suffix === "DEC" && value >= 0 ? "+" : "";
+function normalizeFieldOfView(value: number) {
+  return Math.max(MIN_FIELD_OF_VIEW, Math.min(MAX_FIELD_OF_VIEW, value));
+}
+
+function skyVector(coordinate: SkyCoordinate): [number, number, number] {
+  const ra = (coordinate.raDeg * Math.PI) / 180;
+  const dec = (coordinate.decDeg * Math.PI) / 180;
+  return [Math.cos(dec) * Math.cos(ra), Math.cos(dec) * Math.sin(ra), Math.sin(dec)];
+}
+
+function dot(a: readonly number[], b: readonly number[]) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function cross(a: readonly number[], b: readonly number[]): [number, number, number] {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+function subtract(a: readonly number[], b: readonly number[], scale: number): [number, number, number] {
+  return [a[0] - b[0] * scale, a[1] - b[1] * scale, a[2] - b[2] * scale];
+}
+
+function pointInSphericalPolygon(point: SkyCoordinate, vertices: readonly SkyCoordinate[]) {
+  if (vertices.length < 3) return false;
+
+  const p = skyVector(point);
+  let winding = 0;
+
+  for (let index = 0; index < vertices.length; index += 1) {
+    const first = skyVector(vertices[index]);
+    const second = skyVector(vertices[(index + 1) % vertices.length]);
+    const a = subtract(first, p, dot(first, p));
+    const b = subtract(second, p, dot(second, p));
+    const aLength = Math.hypot(a[0], a[1], a[2]);
+    const bLength = Math.hypot(b[0], b[1], b[2]);
+
+    if (aLength < 1e-10 || bLength < 1e-10) return true;
+
+    winding += Math.atan2(dot(p, cross(a, b)), dot(a, b));
+  }
+
+  return Math.abs(winding) > Math.PI;
+}
+
+function footprintFromEvent(args: readonly unknown[]) {
+  for (const value of args) {
+    if (!value || typeof value !== "object") continue;
+    const object = value as {
+      data?: { id?: unknown };
+      source?: { data?: { id?: unknown } };
+    };
+    const id = object.source?.data?.id ?? object.data?.id;
+    if (typeof id === "string") return id;
+  }
+  return null;
+}
+
+function formatCoordinate(value: number, kind: "RA" | "DEC") {
+  const sign = kind === "DEC" && value >= 0 ? "+" : "";
   return `${sign}${value.toFixed(3)}°`;
 }
 
-function coordinateFromDirection(direction: import("three").Vector3): SkyCoordinate {
-  const normalized = direction.clone().normalize();
-  return {
-    raDeg: normalizeRa((Math.atan2(-normalized.z, normalized.x) * 180) / Math.PI),
-    decDeg: (Math.asin(Math.max(-1, Math.min(1, normalized.y))) * 180) / Math.PI,
-  };
-}
-
-function coordinateVector(
-  THREE: ThreeModule,
-  coordinate: SkyCoordinate,
-  radius: number,
+function createFootprintOverlay(
+  api: AladinGlobal,
+  map: AladinInstance,
+  footprints: readonly SkyFootprint[],
+  selectedId: string | null,
 ) {
-  const ra = (normalizeRa(coordinate.raDeg) * Math.PI) / 180;
-  const dec = (Math.max(-90, Math.min(90, coordinate.decDeg)) * Math.PI) / 180;
-  return new THREE.Vector3(
-    Math.cos(dec) * Math.cos(ra),
-    Math.sin(dec),
-    -Math.cos(dec) * Math.sin(ra),
-  ).multiplyScalar(radius);
-}
-
-function setCameraCenter(
-  THREE: ThreeModule,
-  camera: PerspectiveCamera,
-  coordinate: SkyCoordinate,
-) {
-  const safeCoordinate = normalizeCoordinate(coordinate);
-  const ra = (safeCoordinate.raDeg * Math.PI) / 180;
-  const dec = (safeCoordinate.decDeg * Math.PI) / 180;
-  const direction = coordinateVector(THREE, safeCoordinate, 1);
-  const north = new THREE.Vector3(
-    -Math.sin(dec) * Math.cos(ra),
-    Math.cos(dec),
-    Math.sin(dec) * Math.sin(ra),
-  );
-
-  camera.up.copy(north);
-  camera.position.set(0, 0, 0);
-  camera.lookAt(direction);
-  camera.updateMatrixWorld();
-}
-
-function setHorizontalFieldOfView(
-  camera: PerspectiveCamera,
-  horizontalFovDeg: number,
-  aspect: number,
-) {
-  const horizontalRadians = (Math.max(MIN_FOV, Math.min(MAX_FOV, horizontalFovDeg)) * Math.PI) / 180;
-  const verticalRadians = 2 * Math.atan(Math.tan(horizontalRadians / 2) / Math.max(aspect, 0.1));
-  camera.fov = (verticalRadians * 180) / Math.PI;
-  camera.aspect = aspect;
-  camera.updateProjectionMatrix();
-}
-
-function getHorizontalFieldOfView(camera: PerspectiveCamera) {
-  const verticalRadians = (camera.fov * Math.PI) / 180;
-  return (2 * Math.atan(Math.tan(verticalRadians / 2) * camera.aspect) * 180) / Math.PI;
-}
-
-function createStarfieldTexture(THREE: ThreeModule) {
-  const canvas = document.createElement("canvas");
-  canvas.width = 2048;
-  canvas.height = 1024;
-  const context = canvas.getContext("2d");
-  if (!context) return null;
-
-  const { width, height } = canvas;
-  const base = context.createLinearGradient(0, 0, width, height);
-  base.addColorStop(0, "#020610");
-  base.addColorStop(0.52, "#071222");
-  base.addColorStop(1, "#030711");
-  context.fillStyle = base;
-  context.fillRect(0, 0, width, height);
-
-  context.save();
-  context.translate(width / 2, height / 2);
-  context.rotate(-0.31);
-  context.scale(1, 0.72);
-  const galaxy = context.createLinearGradient(-width / 2, 0, width / 2, 0);
-  galaxy.addColorStop(0, "rgba(40, 95, 150, 0.02)");
-  galaxy.addColorStop(0.2, "rgba(88, 106, 190, 0.16)");
-  galaxy.addColorStop(0.43, "rgba(202, 148, 188, 0.2)");
-  galaxy.addColorStop(0.56, "rgba(246, 189, 144, 0.18)");
-  galaxy.addColorStop(0.75, "rgba(98, 104, 190, 0.17)");
-  galaxy.addColorStop(1, "rgba(43, 95, 150, 0.02)");
-  context.filter = "blur(78px)";
-  context.fillStyle = galaxy;
-  context.beginPath();
-  context.ellipse(0, 0, width * 0.64, 105, 0, 0, Math.PI * 2);
-  context.fill();
-  context.filter = "blur(32px)";
-  context.fillStyle = "rgba(122, 125, 214, 0.11)";
-  context.beginPath();
-  context.ellipse(0, -10, width * 0.55, 46, 0, 0, Math.PI * 2);
-  context.fill();
-  context.restore();
-  context.filter = "none";
-
-  let seed = 240719;
-  const random = () => {
-    seed = (seed * 1664525 + 1013904223) >>> 0;
-    return seed / 4294967296;
-  };
-  const starColors = ["#d8e7ff", "#91caff", "#ffffff", "#ffd7b5"];
-
-  for (let index = 0; index < 3200; index += 1) {
-    const x = random() * width;
-    const y = random() * height;
-    const size = Math.pow(random(), 3) * 1.7 + 0.18;
-    const alpha = 0.25 + random() * 0.7;
-    context.globalAlpha = alpha;
-    context.fillStyle = starColors[Math.floor(random() * starColors.length)];
-    context.beginPath();
-    context.arc(x, y, size, 0, Math.PI * 2);
-    context.fill();
-
-    if (size > 1.35) {
-      const glow = context.createRadialGradient(x, y, 0, x, y, size * 8);
-      glow.addColorStop(0, "rgba(182, 220, 255, 0.55)");
-      glow.addColorStop(1, "rgba(123, 180, 255, 0)");
-      context.globalAlpha = 0.55;
-      context.fillStyle = glow;
-      context.beginPath();
-      context.arc(x, y, size * 8, 0, Math.PI * 2);
-      context.fill();
-    }
-  }
-  context.globalAlpha = 1;
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = 4;
-  return texture;
-}
-
-function createCoordinateGrid(THREE: ThreeModule) {
-  const group = new THREE.Group();
-  const radius = 99.55;
-  const lineMaterial = new THREE.LineBasicMaterial({
-    color: 0x4da9ca,
-    transparent: true,
-    opacity: 0.28,
-    depthWrite: false,
+  const overlay = api.graphicOverlay({
+    name: "SPHEREx observation footprints",
+    color: "#55d8ec",
+    lineWidth: 2,
   });
-  const majorMaterial = new THREE.LineBasicMaterial({
-    color: 0x75c4de,
-    transparent: true,
-    opacity: 0.46,
-    depthWrite: false,
-  });
-
-  for (let raDeg = 0; raDeg < 360; raDeg += 15) {
-    const points: import("three").Vector3[] = [];
-    for (let index = 0; index <= 120; index += 1) {
-      const decDeg = -90 + (180 * index) / 120;
-      points.push(coordinateVector(THREE, { raDeg, decDeg }, radius));
-    }
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    group.add(new THREE.Line(geometry, raDeg % 30 === 0 ? majorMaterial : lineMaterial));
-  }
-
-  for (let decDeg = -75; decDeg <= 75; decDeg += 15) {
-    const points: import("three").Vector3[] = [];
-    for (let index = 0; index <= 240; index += 1) {
-      const raDeg = (360 * index) / 240;
-      points.push(coordinateVector(THREE, { raDeg, decDeg }, radius));
-    }
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    group.add(new THREE.Line(geometry, decDeg % 30 === 0 ? majorMaterial : lineMaterial));
-  }
-
-  const addLabel = (text: string, coordinate: SkyCoordinate) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = 128;
-    canvas.height = 48;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.font = "24px monospace";
-    context.textAlign = "center";
-    context.textBaseline = "middle";
-    context.fillStyle = "rgba(166, 221, 238, 0.9)";
-    context.fillText(text, canvas.width / 2, canvas.height / 2);
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    const material = new THREE.SpriteMaterial({
-      map: texture,
-      transparent: true,
-      depthWrite: false,
-    });
-    const label = new THREE.Sprite(material);
-    label.position.copy(coordinateVector(THREE, coordinate, 99.1));
-    label.scale.set(4.6, 1.8, 1);
-    group.add(label);
-  };
-  for (let raDeg = 0; raDeg < 360; raDeg += 30) {
-    addLabel(`${String(Math.round(raDeg / 15)).padStart(2, "0")}h`, {
-      raDeg,
-      decDeg: 2,
-    });
-  }
-  for (let decDeg = -60; decDeg <= 60; decDeg += 30) {
-    addLabel(`${decDeg > 0 ? "+" : ""}${decDeg}°`, {
-      raDeg: 2,
-      decDeg,
-    });
-  }
-
-  return group;
-}
-
-function createFootprintGroup(THREE: ThreeModule, footprints: readonly SkyFootprint[]) {
-  const group = new THREE.Group();
 
   for (const footprint of footprints) {
-    const vertices = footprint.vertices
-      .filter(
-        (vertex) =>
-          Number.isFinite(vertex.raDeg) &&
-          Number.isFinite(vertex.decDeg) &&
-          vertex.decDeg >= -90 &&
-          vertex.decDeg <= 90,
-      )
-      .map((vertex) => coordinateVector(THREE, vertex, 99.25));
-
-    if (vertices.length < 3) continue;
-
-    const selected = Boolean(footprint.selected);
-    const color = selected ? 0xffbd68 : 0x47d9ff;
-    const centroid = vertices
-      .reduce((sum, vertex) => sum.add(vertex.clone().normalize()), new THREE.Vector3())
-      .normalize()
-      .multiplyScalar(99.25);
-
-    const fillValues: number[] = [];
-    for (let index = 0; index < vertices.length; index += 1) {
-      for (const vertex of [centroid, vertices[index], vertices[(index + 1) % vertices.length]]) {
-        fillValues.push(vertex.x, vertex.y, vertex.z);
-      }
-    }
-    const fillGeometry = new THREE.BufferGeometry();
-    fillGeometry.setAttribute("position", new THREE.Float32BufferAttribute(fillValues, 3));
-    const fillMaterial = new THREE.MeshBasicMaterial({
-      color,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: selected ? 0.2 : 0.1,
-      depthWrite: false,
+    if (footprint.vertices.length < 3) continue;
+    const selected = footprint.id === selectedId;
+    const vertices = footprint.vertices.map(
+      ({ raDeg, decDeg }) => [raDeg, decDeg] as const,
+    );
+    const polygon = api.polygon(vertices, {
+      color: selected ? "#ffd18a" : "#67d9ee",
+      fill: true,
+      fillColor: selected ? "#ffd18a" : "#67d9ee",
+      opacity: selected ? 0.14 : 0.07,
+      lineWidth: selected ? 3 : 2,
+      selectionColor: "#fff0cc",
+      hoverColor: "#ffffff",
     });
-    const fillMesh = new THREE.Mesh(fillGeometry, fillMaterial);
-    fillMesh.userData.footprintId = footprint.id;
-    group.add(fillMesh);
-
-    const outline: import("three").Vector3[] = [];
-    for (let index = 0; index < vertices.length; index += 1) {
-      const start = vertices[index].clone().normalize();
-      const end = vertices[(index + 1) % vertices.length].clone().normalize();
-      const angle = start.angleTo(end);
-      const sinAngle = Math.sin(angle);
-      const steps = Math.max(6, Math.ceil((angle * 180) / Math.PI / 1.5));
-      for (let step = 0; step < steps; step += 1) {
-        const t = step / steps;
-        const point =
-          Math.abs(sinAngle) < 1e-6
-            ? start.clone().lerp(end, t).normalize()
-            : start
-                .clone()
-                .multiplyScalar(Math.sin((1 - t) * angle) / sinAngle)
-                .add(end.clone().multiplyScalar(Math.sin(t * angle) / sinAngle))
-                .normalize();
-        outline.push(point.multiplyScalar(99.05));
-      }
-    }
-    outline.push(outline[0].clone());
-    const outlineGeometry = new THREE.BufferGeometry().setFromPoints(outline);
-    const outlineMaterial = new THREE.LineBasicMaterial({
-      color,
-      transparent: true,
-      opacity: selected ? 1 : 0.82,
-      depthWrite: false,
-    });
-    const outlineLine = new THREE.Line(outlineGeometry, outlineMaterial);
-    outlineLine.userData.footprintId = footprint.id;
-    group.add(outlineLine);
+    const anchor = footprint.vertices[0];
+    const source = api.source(anchor.raDeg, anchor.decDeg, { id: footprint.id });
+    const shape = api.footprint([polygon], source);
+    overlay.addFootprints(shape);
   }
 
-  return group;
-}
-
-function disposeObject(object: import("three").Object3D) {
-  const candidate = object as import("three").Object3D & {
-    geometry?: import("three").BufferGeometry;
-    material?: import("three").Material | import("three").Material[];
-  };
-  candidate.geometry?.dispose();
-  const materials = Array.isArray(candidate.material)
-    ? candidate.material
-    : candidate.material
-      ? [candidate.material]
-      : [];
-  for (const material of materials) {
-    const mappedMaterial = material as import("three").Material & { map?: import("three").Texture };
-    mappedMaterial.map?.dispose();
-    material.dispose();
-  }
+  map.addOverlay(overlay);
+  return overlay;
 }
 
 export default function SkyViewport({
   viewCenter,
   fieldOfViewDeg,
-  footprints = EMPTY_FOOTPRINTS,
+  footprints = DEMO_FOOTPRINTS,
   onViewSettled,
   onFootprintSelect,
 }: SkyViewportProps) {
-  const safeFootprints = footprints;
-  const containerRef = useRef<HTMLDivElement>(null);
-  const runtimeRef = useRef<ViewportRuntime | null>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestedCenter = normalizeCoordinate(viewCenter ?? DEMO_CENTER);
+  const requestedFov = normalizeFieldOfView(fieldOfViewDeg ?? DEMO_FIELD_OF_VIEW_DEG);
+  const mapHostRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<AladinInstance | null>(null);
+  const apiRef = useRef<AladinGlobal | null>(null);
+  const overlayRef = useRef<AladinOverlay | null>(null);
+  const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onViewSettledRef = useRef(onViewSettled);
   const onFootprintSelectRef = useRef(onFootprintSelect);
-  const footprintsRef = useRef(safeFootprints);
-  const requestedRa = viewCenter?.raDeg ?? INITIAL_CENTER.raDeg;
-  const requestedDec = viewCenter?.decDeg ?? INITIAL_CENTER.decDeg;
-  const requestedCenter = useMemo(
-    () => normalizeCoordinate({ raDeg: requestedRa, decDeg: requestedDec }),
-    [requestedRa, requestedDec],
-  );
-  const requestedFov = useMemo(
-    () => Math.max(MIN_FOV, Math.min(MAX_FOV, fieldOfViewDeg ?? INITIAL_FOV)),
-    [fieldOfViewDeg],
-  );
-  const desiredViewRef = useRef<SkyViewState>({
-    center: requestedCenter,
-    fieldOfViewDeg: requestedFov,
-  });
+  const selectedFootprintIdRef = useRef<string | null>(null);
+  const appliedSurveyRef = useRef<SurveyId | null>(null);
+  const footprintsRef = useRef(footprints);
+
+  const [scriptReady, setScriptReady] = useState(false);
+  const [surveyPreferenceReady, setSurveyPreferenceReady] = useState(false);
+  const [surveyChoice, setSurveyChoice] = useState<SurveyId>("optical");
+  const [showSurveyPicker, setShowSurveyPicker] = useState(false);
+  const [mapStatus, setMapStatus] = useState<"loading" | "ready" | "fallback">("loading");
+  const [localStarfieldRequested, setLocalStarfieldRequested] = useState(false);
+  const [selectedFootprintId, setSelectedFootprintId] = useState<string | null>(null);
+  const [gridVisible, setGridVisible] = useState(true);
   const [view, setView] = useState<SkyViewState>(() => ({
     center: requestedCenter,
     fieldOfViewDeg: requestedFov,
   }));
-  const [viewportStatus, setViewportStatus] = useState<"loading" | "ready" | "fallback">("loading");
+  const hasControlledCenter = viewCenter !== undefined;
+  const visibleSelectedFootprintId = footprints.some(
+    (footprint) => footprint.id === selectedFootprintId,
+  )
+    ? selectedFootprintId
+    : null;
+  const showLocalStarfield = localStarfieldRequested || mapStatus === "fallback";
+  const mapControlsDisabled = mapStatus !== "ready" || showLocalStarfield;
 
   useEffect(() => {
     onViewSettledRef.current = onViewSettled;
     onFootprintSelectRef.current = onFootprintSelect;
-    footprintsRef.current = safeFootprints;
-  }, [onFootprintSelect, onViewSettled, safeFootprints]);
+  }, [onFootprintSelect, onViewSettled]);
 
-  const refreshViewReadout = useCallback((runtime: ViewportRuntime) => {
-    const direction = new runtime.THREE.Vector3();
-    runtime.camera.getWorldDirection(direction);
-    const nextView = {
-      center: coordinateFromDirection(direction),
-      fieldOfViewDeg: getHorizontalFieldOfView(runtime.camera),
+  useEffect(() => {
+    footprintsRef.current = footprints;
+  }, [footprints]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const restorePreference = async () => {
+      // Read browser-only storage after hydration, before creating the survey view.
+      await Promise.resolve();
+      let savedSurvey: string | null = null;
+      try {
+        savedSurvey = window.localStorage.getItem(SURVEY_STORAGE_KEY);
+      } catch {
+        // Storage can be unavailable in private browsing contexts.
+      }
+      if (cancelled) return;
+
+      if (savedSurvey === "optical" || savedSurvey === "infrared") {
+        setSurveyChoice(savedSurvey);
+        setShowSurveyPicker(false);
+      } else {
+        setShowSurveyPicker(true);
+      }
+      setSurveyPreferenceReady(true);
     };
-    desiredViewRef.current = nextView;
+
+    void restorePreference();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const updateViewFromMap = useCallback((map: AladinInstance) => {
+    const [raDeg, decDeg] = map.getRaDec();
+    const [mapFov] = map.getFoV();
+    const nextView = {
+      center: normalizeCoordinate({ raDeg, decDeg }),
+      fieldOfViewDeg: normalizeFieldOfView(mapFov),
+    };
     setView(nextView);
     return nextView;
   }, []);
 
   const scheduleViewSettled = useCallback(
-    (runtime: ViewportRuntime) => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => {
-        const nextView = refreshViewReadout(runtime);
-        onViewSettledRef.current?.(nextView);
+    (map: AladinInstance) => {
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = setTimeout(() => {
+        onViewSettledRef.current?.(updateViewFromMap(map));
       }, 280);
     },
-    [refreshViewReadout],
+    [updateViewFromMap],
   );
 
+  const selectFootprint = useCallback((id: string) => {
+    if (selectedFootprintIdRef.current === id) return;
+    selectedFootprintIdRef.current = id;
+    setSelectedFootprintId(id);
+    onFootprintSelectRef.current?.(id);
+  }, []);
+
   useEffect(() => {
-    let disposed = false;
-    let runtime: ViewportRuntime | null = null;
-    let partialRenderer: WebGLRenderer | null = null;
-    const container = containerRef.current;
-    if (!container) return undefined;
+    const mapHost = mapHostRef.current;
+    if (!scriptReady || !surveyPreferenceReady || !mapHost) return undefined;
 
-    void import("three")
-      .then((THREE) => {
-        if (disposed || !containerRef.current) return;
+    let cancelled = false;
+    let activeMap: AladinInstance | null = null;
 
-        try {
-          const renderer = new THREE.WebGLRenderer({
-            antialias: true,
-            alpha: false,
-            powerPreference: "high-performance",
-          });
-          partialRenderer = renderer;
-          renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
-          renderer.setClearColor(0x020611, 1);
-          renderer.domElement.className = styles.canvas;
-          renderer.domElement.tabIndex = 0;
-          renderer.domElement.setAttribute(
-            "aria-label",
-            "Interactive celestial viewport. Drag to look around, use the arrow keys to pan, and use plus or minus to zoom.",
-          );
-          renderer.domElement.setAttribute("role", "application");
-          container.appendChild(renderer.domElement);
+    const initializeMap = async () => {
+      try {
+        const api = window.A;
+        if (!api) throw new Error("Aladin Lite did not load");
 
-          const scene = new THREE.Scene();
-          const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 300);
-          const texture = createStarfieldTexture(THREE);
-          const skyMaterial = new THREE.MeshBasicMaterial({
-            color: texture ? 0xffffff : 0x07111f,
-            map: texture ?? undefined,
-            side: THREE.BackSide,
-            depthWrite: false,
-          });
-          const sky = new THREE.Mesh(new THREE.SphereGeometry(100, 72, 48), skyMaterial);
-          scene.add(sky);
-          scene.add(createCoordinateGrid(THREE));
+        await api.init;
+        if (cancelled) return;
 
-          const footprintGroup = createFootprintGroup(THREE, footprintsRef.current);
-          scene.add(footprintGroup);
-
-          const resizeObserver = new ResizeObserver(() => {
-            const { width, height } = container.getBoundingClientRect();
-            if (!width || !height) return;
-            renderer.setSize(width, height, false);
-            setHorizontalFieldOfView(
-              camera,
-              desiredViewRef.current.fieldOfViewDeg,
-              width / height,
-            );
-            renderer.render(scene, camera);
-          });
-          resizeObserver.observe(container);
-
-          const firstRect = container.getBoundingClientRect();
-          const aspect = firstRect.width && firstRect.height ? firstRect.width / firstRect.height : 1;
-          setHorizontalFieldOfView(camera, desiredViewRef.current.fieldOfViewDeg, aspect);
-          setCameraCenter(THREE, camera, desiredViewRef.current.center);
-          renderer.setSize(Math.max(firstRect.width, 1), Math.max(firstRect.height, 1), false);
-          renderer.render(scene, camera);
-
-          runtime = { THREE, camera, footprintGroup, renderer, scene, resizeObserver };
-          runtimeRef.current = runtime;
-          setViewportStatus("ready");
-          setView({
-            center: desiredViewRef.current.center,
-            fieldOfViewDeg: desiredViewRef.current.fieldOfViewDeg,
-          });
-
-          const raycaster = new THREE.Raycaster();
-          const pointer = new THREE.Vector2();
-          let pointerStart = { x: 0, y: 0 };
-          let pointerLast = { x: 0, y: 0 };
-          let isPointerDown = false;
-          let hasDragged = false;
-
-          const render = () => {
-            if (!disposed) renderer.render(scene, camera);
-          };
-
-          const zoomBy = (factor: number) => {
-            const aspectNow = camera.aspect || 1;
-            const nextHorizontalFov = Math.max(
-              MIN_FOV,
-              Math.min(MAX_FOV, getHorizontalFieldOfView(camera) * factor),
-            );
-            setHorizontalFieldOfView(camera, nextHorizontalFov, aspectNow);
-            render();
-            const nextView = refreshViewReadout(runtime!);
-            scheduleViewSettled(runtime!);
-            return nextView;
-          };
-
-          const onPointerDown = (event: PointerEvent) => {
-            if (event.button !== 0) return;
-            isPointerDown = true;
-            hasDragged = false;
-            pointerStart = { x: event.clientX, y: event.clientY };
-            pointerLast = pointerStart;
-            renderer.domElement.setPointerCapture(event.pointerId);
-            renderer.domElement.style.cursor = "grabbing";
-          };
-
-          const onPointerMove = (event: PointerEvent) => {
-            if (!isPointerDown) return;
-            const rect = renderer.domElement.getBoundingClientRect();
-            const deltaX = event.clientX - pointerLast.x;
-            const deltaY = event.clientY - pointerLast.y;
-            pointerLast = { x: event.clientX, y: event.clientY };
-            if (
-              Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) > 5
-            ) {
-              hasDragged = true;
-            }
-            if (!hasDragged || !rect.width || !rect.height) return;
-
-            const horizontalRadians = (getHorizontalFieldOfView(camera) * Math.PI) / 180;
-            const verticalRadians = (camera.fov * Math.PI) / 180;
-            const yaw = new THREE.Quaternion().setFromAxisAngle(
-              new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion),
-              (-deltaX / rect.width) * horizontalRadians,
-            );
-            camera.quaternion.premultiply(yaw);
-            const cameraRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
-            const pitch = new THREE.Quaternion().setFromAxisAngle(
-              cameraRight,
-              (deltaY / rect.height) * verticalRadians,
-            );
-            camera.quaternion.premultiply(pitch);
-            camera.updateMatrixWorld();
-            render();
-            refreshViewReadout(runtime!);
-            scheduleViewSettled(runtime!);
-          };
-
-          const onPointerUp = (event: PointerEvent) => {
-            if (!isPointerDown) return;
-            isPointerDown = false;
-            renderer.domElement.style.cursor = "grab";
-            if (!hasDragged) {
-              const rect = renderer.domElement.getBoundingClientRect();
-              pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-              pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-              raycaster.setFromCamera(pointer, camera);
-              const intersections = raycaster.intersectObjects(
-                runtime!.footprintGroup.children,
-                true,
-              );
-              const selectedObject = intersections.find(
-                (intersection) => typeof intersection.object.userData.footprintId === "string",
-              );
-              const selectedId = selectedObject?.object.userData.footprintId;
-              if (typeof selectedId === "string") onFootprintSelectRef.current?.(selectedId);
-            }
-            if (hasDragged) scheduleViewSettled(runtime!);
-          };
-
-          const onPointerCancel = () => {
-            isPointerDown = false;
-            renderer.domElement.style.cursor = "grab";
-          };
-
-          const onWheel = (event: WheelEvent) => {
-            event.preventDefault();
-            zoomBy(Math.exp(event.deltaY * 0.001));
-          };
-
-          const onKeyDown = (event: KeyboardEvent) => {
-            const key = event.key;
-            if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "+", "=", "-", "Home"].includes(key)) {
-              return;
-            }
-            event.preventDefault();
-            if (key === "+" || key === "=") {
-              zoomBy(0.84);
-              return;
-            }
-            if (key === "-") {
-              zoomBy(1.19);
-              return;
-            }
-            if (key === "Home") {
-              setHorizontalFieldOfView(camera, INITIAL_FOV, camera.aspect || 1);
-              setCameraCenter(THREE, camera, INITIAL_CENTER);
-              render();
-              refreshViewReadout(runtime!);
-              scheduleViewSettled(runtime!);
-              return;
-            }
-
-            const horizontalStep = (getHorizontalFieldOfView(camera) * Math.PI) / 180 / 14;
-            const verticalStep = (camera.fov * Math.PI) / 180 / 14;
-            const direction = key === "ArrowLeft" || key === "ArrowUp" ? 1 : -1;
-            const axis =
-              key === "ArrowLeft" || key === "ArrowRight"
-                ? new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion)
-                : new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
-            const amount =
-              key === "ArrowLeft" || key === "ArrowRight" ? horizontalStep : verticalStep;
-            camera.quaternion.premultiply(
-              new THREE.Quaternion().setFromAxisAngle(axis, direction * amount),
-            );
-            camera.updateMatrixWorld();
-            render();
-            refreshViewReadout(runtime!);
-            scheduleViewSettled(runtime!);
-          };
-
-          renderer.domElement.addEventListener("pointerdown", onPointerDown);
-          renderer.domElement.addEventListener("pointermove", onPointerMove);
-          renderer.domElement.addEventListener("pointerup", onPointerUp);
-          renderer.domElement.addEventListener("pointercancel", onPointerCancel);
-          renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
-          renderer.domElement.addEventListener("keydown", onKeyDown);
-
-          const removeInteractionListeners = () => {
-            renderer.domElement.removeEventListener("pointerdown", onPointerDown);
-            renderer.domElement.removeEventListener("pointermove", onPointerMove);
-            renderer.domElement.removeEventListener("pointerup", onPointerUp);
-            renderer.domElement.removeEventListener("pointercancel", onPointerCancel);
-            renderer.domElement.removeEventListener("wheel", onWheel);
-            renderer.domElement.removeEventListener("keydown", onKeyDown);
-          };
-          (runtime as ViewportRuntime & { removeInteractionListeners?: () => void }).removeInteractionListeners =
-            removeInteractionListeners;
-        } catch {
-          partialRenderer?.dispose();
-          partialRenderer?.domElement.remove();
-          setViewportStatus("fallback");
+        activeMap = api.aladin(mapHost, {
+          target: `${requestedCenter.raDeg} ${requestedCenter.decDeg}`,
+          survey: SURVEYS[surveyChoice].id,
+          cooFrame: "ICRSd",
+          projection: "TAN",
+          fov: requestedFov,
+          mode: "dark",
+          inertia: true,
+          showZoomControl: false,
+          showLayersControl: false,
+          showFullscreenControl: false,
+          showSimbadPointerControl: false,
+          showCooGridControl: false,
+          showSettingsControl: false,
+          showColorPickerControl: false,
+          showShareControl: false,
+          showProjectionControl: false,
+          showStatusBar: true,
+          showFrame: false,
+          showFov: false,
+          showCooLocation: false,
+          showReticle: false,
+          showCooGrid: true,
+          gridColor: "#83c6d8",
+          gridOpacity: 0.34,
+          gridOptions: {
+            color: "#83c6d8",
+            opacity: 0.34,
+            thickness: 1,
+            labelSize: 11,
+            showLabels: true,
+          },
+        });
+        if (cancelled) {
+          activeMap.destroy?.();
+          return;
         }
-      })
-      .catch(() => setViewportStatus("fallback"));
+
+        apiRef.current = api;
+        mapRef.current = activeMap;
+        appliedSurveyRef.current = surveyChoice;
+        activeMap.setDefaultColor("#78d9ed");
+        activeMap.setFoVRange(MIN_FIELD_OF_VIEW, MAX_FIELD_OF_VIEW);
+        activeMap.setCooGrid({
+          enabled: true,
+          color: "#83c6d8",
+          opacity: 0.34,
+          thickness: 1,
+          labelSize: 11,
+        });
+
+        activeMap.on("positionChanged", (...args) => {
+          const event = (args[0] ?? {}) as { dragging?: boolean };
+          updateViewFromMap(activeMap!);
+          if (!event.dragging) scheduleViewSettled(activeMap!);
+        });
+        activeMap.on("zoomChanged", () => {
+          updateViewFromMap(activeMap!);
+          scheduleViewSettled(activeMap!);
+        });
+        activeMap.on("footprintClicked", (...args) => {
+          const id = footprintFromEvent(args);
+          if (id && footprintsRef.current.some((footprint) => footprint.id === id)) {
+            selectFootprint(id);
+          }
+        });
+
+        setMapStatus("ready");
+        updateViewFromMap(activeMap);
+      } catch {
+        if (!cancelled) setMapStatus("fallback");
+      }
+    };
+
+    void initializeMap();
 
     return () => {
-      disposed = true;
-      if (timerRef.current) clearTimeout(timerRef.current);
-      runtime?.resizeObserver.disconnect();
-      if (runtime) {
-        (runtime as ViewportRuntime & { removeInteractionListeners?: () => void })
-          .removeInteractionListeners?.();
-        runtime.scene.traverse(disposeObject);
-        runtime.renderer.dispose();
-        runtime.renderer.domElement.remove();
-      } else {
-        partialRenderer?.dispose();
-        partialRenderer?.domElement.remove();
+      cancelled = true;
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      if (activeMap) {
+        activeMap.off?.("positionChanged");
+        activeMap.off?.("zoomChanged");
+        activeMap.off?.("footprintClicked");
+        activeMap.destroy?.();
       }
-      runtimeRef.current = null;
+      if (mapRef.current === activeMap) mapRef.current = null;
+      if (apiRef.current === window.A) apiRef.current = null;
+      overlayRef.current = null;
+      mapHost.replaceChildren();
     };
-  }, [refreshViewReadout, scheduleViewSettled]);
+    // The map is created once from the restored survey preference; later survey changes use setBaseImageLayer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scriptReady, surveyPreferenceReady]);
 
   useEffect(() => {
-    desiredViewRef.current = {
-      center: requestedCenter,
-      fieldOfViewDeg: requestedFov,
+    const map = mapRef.current;
+    const api = apiRef.current;
+    if (!map || !api || mapStatus !== "ready") return;
+
+    if (overlayRef.current) map.removeOverlay(overlayRef.current);
+    overlayRef.current = createFootprintOverlay(api, map, footprints, visibleSelectedFootprintId);
+
+    return () => {
+      if (overlayRef.current) map.removeOverlay(overlayRef.current);
+      overlayRef.current = null;
     };
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
-    setCameraCenter(runtime.THREE, runtime.camera, requestedCenter);
-    setHorizontalFieldOfView(
-      runtime.camera,
-      requestedFov,
-      runtime.camera.aspect || 1,
-    );
-    runtime.renderer.render(runtime.scene, runtime.camera);
+  }, [footprints, mapStatus, visibleSelectedFootprintId]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapStatus !== "ready") return;
+    if (appliedSurveyRef.current === surveyChoice) return;
+    map.setBaseImageLayer(SURVEYS[surveyChoice].id);
+    appliedSurveyRef.current = surveyChoice;
+    try {
+      window.localStorage.setItem(SURVEY_STORAGE_KEY, surveyChoice);
+    } catch {
+      // The selected survey still works for this session if storage is unavailable.
+    }
+  }, [mapStatus, surveyChoice]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapStatus !== "ready") return;
+    if (hasControlledCenter) map.gotoRaDec(requestedCenter.raDeg, requestedCenter.decDeg);
+    if (fieldOfViewDeg !== undefined) map.setFoV(requestedFov);
+  }, [fieldOfViewDeg, hasControlledCenter, mapStatus, requestedCenter.decDeg, requestedCenter.raDeg, requestedFov]);
+
+  const handleSurveyChange = useCallback((nextSurvey: SurveyId) => {
+    setSurveyChoice(nextSurvey);
+    setShowSurveyPicker(false);
+    try {
+      window.localStorage.setItem(SURVEY_STORAGE_KEY, nextSurvey);
+    } catch {
+      // The in-memory selection remains active for this session.
+    }
+  }, []);
+
+  const resetView = useCallback(() => {
+    const map = mapRef.current;
+    if (map) {
+      map.gotoRaDec(requestedCenter.raDeg, requestedCenter.decDeg);
+      map.setFoV(requestedFov);
+    }
     setView({ center: requestedCenter, fieldOfViewDeg: requestedFov });
   }, [requestedCenter, requestedFov]);
 
-  useEffect(() => {
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
+  const selectFootprintAt = useCallback(
+    (coordinate: SkyCoordinate) => {
+      const match = footprints.find((footprint) =>
+        pointInSphericalPolygon(coordinate, footprint.vertices),
+      );
+      if (match) selectFootprint(match.id);
+    },
+    [footprints, selectFootprint],
+  );
 
-    const nextGroup = createFootprintGroup(runtime.THREE, safeFootprints);
-    runtime.footprintGroup.traverse(disposeObject);
-    runtime.scene.remove(runtime.footprintGroup);
-    runtime.scene.add(nextGroup);
-    runtime.footprintGroup = nextGroup;
-    runtime.renderer.render(runtime.scene, runtime.camera);
-  }, [safeFootprints]);
+  const handleMapPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || event.target instanceof Element && event.target.closest(".aladin-status-bar")) {
+      pointerStartRef.current = null;
+      return;
+    }
+    pointerStartRef.current = { x: event.clientX, y: event.clientY };
+  }, []);
 
-  const zoomIn = () => {
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
-    const nextFov = Math.max(MIN_FOV, getHorizontalFieldOfView(runtime.camera) * 0.84);
-    setHorizontalFieldOfView(runtime.camera, nextFov, runtime.camera.aspect || 1);
-    runtime.renderer.render(runtime.scene, runtime.camera);
-    refreshViewReadout(runtime);
-    scheduleViewSettled(runtime);
-  };
+  const handleMapPointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const start = pointerStartRef.current;
+      pointerStartRef.current = null;
+      const map = mapRef.current;
+      const host = mapHostRef.current;
+      if (!start || !map || !host || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5) {
+        return;
+      }
+      const bounds = host.getBoundingClientRect();
+      const [raDeg, decDeg] = map.pix2world(event.clientX - bounds.left, event.clientY - bounds.top, "ICRS");
+      if (Number.isFinite(raDeg) && Number.isFinite(decDeg)) {
+        selectFootprintAt({ raDeg, decDeg });
+      }
+    },
+    [selectFootprintAt],
+  );
 
-  const zoomOut = () => {
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
-    const nextFov = Math.min(MAX_FOV, getHorizontalFieldOfView(runtime.camera) * 1.19);
-    setHorizontalFieldOfView(runtime.camera, nextFov, runtime.camera.aspect || 1);
-    runtime.renderer.render(runtime.scene, runtime.camera);
-    refreshViewReadout(runtime);
-    scheduleViewSettled(runtime);
-  };
+  const handleMapKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const [raDeg, decDeg] = map.getRaDec();
+      const [currentFov] = map.getFoV();
+      const step = Math.max(currentFov * 0.14, 0.02);
+      const decStep = Math.sign(decDeg || 1) * Math.cos((decDeg * Math.PI) / 180);
+      const next: SkyCoordinate = { raDeg, decDeg };
 
-  const resetView = () => {
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
-    setCameraCenter(runtime.THREE, runtime.camera, INITIAL_CENTER);
-    setHorizontalFieldOfView(runtime.camera, INITIAL_FOV, runtime.camera.aspect || 1);
-    runtime.renderer.render(runtime.scene, runtime.camera);
-    refreshViewReadout(runtime);
-    scheduleViewSettled(runtime);
-  };
+      switch (event.key) {
+        case "ArrowLeft":
+          next.raDeg -= step / Math.max(Math.abs(decStep), 0.12);
+          break;
+        case "ArrowRight":
+          next.raDeg += step / Math.max(Math.abs(decStep), 0.12);
+          break;
+        case "ArrowUp":
+          next.decDeg += step;
+          break;
+        case "ArrowDown":
+          next.decDeg -= step;
+          break;
+        case "+":
+        case "=":
+        case "Add":
+          event.preventDefault();
+          map.setFoV(normalizeFieldOfView(currentFov * 0.82));
+          scheduleViewSettled(map);
+          return;
+        case "-":
+        case "Subtract":
+          event.preventDefault();
+          map.setFoV(normalizeFieldOfView(currentFov / 0.82));
+          scheduleViewSettled(map);
+          return;
+        case "Home":
+          event.preventDefault();
+          resetView();
+          return;
+        case "Enter":
+        case " ":
+          event.preventDefault();
+          selectFootprintAt({ raDeg, decDeg });
+          return;
+        default:
+          return;
+      }
+
+      event.preventDefault();
+      map.gotoRaDec(normalizeCoordinate(next).raDeg, normalizeCoordinate(next).decDeg);
+      scheduleViewSettled(map);
+    },
+    [resetView, scheduleViewSettled, selectFootprintAt],
+  );
+
+  const activeFootprintIsDemo = visibleSelectedFootprintId === DEMO_FOOTPRINT_ID;
 
   return (
-    <main className={styles.cockpit} aria-label="SkyDetective celestial cockpit">
-      <div className={styles.viewport} ref={containerRef}>
-        {viewportStatus === "fallback" && (
-          <div className={styles.fallback} role="status">
-            <div className={styles.fallbackStars} aria-hidden="true" />
-            <div className={styles.fallbackMessage}>
-              <span className={styles.fallbackEyebrow}>VIEWPORT SYSTEM</span>
-              <strong>3D sky view unavailable</strong>
-              <span>Enable WebGL or open SkyDetective in a supported browser.</span>
-            </div>
-          </div>
-        )}
+    <main className={styles.cockpit}>
+      <Script
+        id="aladin-lite-v3"
+        src={ALADIN_SCRIPT}
+        strategy="afterInteractive"
+        onReady={() => setScriptReady(true)}
+        onError={() => setMapStatus("fallback")}
+      />
 
+      <section className={styles.viewport} aria-label="Interactive SPHEREx sky atlas">
+        <div className={styles.starfieldFallback} aria-hidden="true" />
+        <div
+          className={`${styles.mapHost} ${showLocalStarfield ? styles.mapHidden : ""}`}
+          ref={mapHostRef}
+          role="application"
+          tabIndex={0}
+          aria-label="Interactive sky map. Drag or swipe to pan, scroll or pinch to zoom, use the arrow keys to navigate, plus and minus to zoom, and Home to return to the SPHEREx demo field."
+          aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown + - Home Enter"
+          onKeyDown={handleMapKeyDown}
+          onPointerDownCapture={handleMapPointerDown}
+          onPointerUpCapture={handleMapPointerUp}
+          onPointerCancelCapture={() => {
+            pointerStartRef.current = null;
+          }}
+        />
+        <div className={styles.viewportShade} aria-hidden="true" />
         <div className={styles.canopy} aria-hidden="true" />
+
         <div className={styles.reticle} aria-hidden="true">
           <span className={styles.reticleRing} />
           <span className={styles.reticleHorizontal} />
@@ -773,106 +595,173 @@ export default function SkyViewport({
           <span className={styles.reticleDot} />
         </div>
 
-        <header className={styles.topHud}>
+        <header className={styles.topBar}>
           <div className={styles.brand}>
-            <div className={styles.brandMark} aria-hidden="true">
+            <span className={styles.brandMark} aria-hidden="true">
               <span />
-            </div>
+            </span>
             <div>
-              <p className={styles.kicker}>FLIGHT DECK · DEEP SKY</p>
+              <p className={styles.kicker}>FLIGHT DECK · SPHEREx ARCHIVE</p>
               <h1>SkyDetective</h1>
             </div>
           </div>
-          <div className={styles.systemStatus}>
-            <span className={styles.statusDot} />
-            <div>
-              <strong>CELESTIAL VIEWPORT</strong>
-              <span>INSIDE-OUT NAVIGATION</span>
-            </div>
+
+          <div className={styles.topActions}>
+            <label className={styles.surveySelect}>
+              <span>SKY SURVEY</span>
+              <select
+                aria-label="Choose sky survey background"
+                value={surveyChoice}
+                onChange={(event) => handleSurveyChange(event.currentTarget.value as SurveyId)}
+                disabled={mapStatus !== "ready"}
+              >
+                <option value="optical">Optical color · DSS2</option>
+                <option value="infrared">Near-infrared · 2MASS</option>
+              </select>
+            </label>
+            <button
+              className={styles.compareButton}
+              type="button"
+              onClick={() => {
+                const demoFootprint = footprints.find((footprint) => footprint.id === DEMO_FOOTPRINT_ID);
+                if (demoFootprint) selectFootprint(demoFootprint.id);
+              }}
+              disabled={!footprints.some((footprint) => footprint.id === DEMO_FOOTPRINT_ID)}
+            >
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M3 4.5h14M3 10h14M3 15.5h14M7 2v16m6-16v16" />
+              </svg>
+              Compare dates
+            </button>
           </div>
         </header>
 
-        <section className={styles.coordinatePanel} aria-live="polite" aria-label="View center coordinates">
-          <div className={styles.panelTitle}>
-            <span className={styles.panelGlyph}>◉</span>
-            <span>RETICLE COORDINATES</span>
-          </div>
-          <div className={styles.coordinateRow}>
-            <span>RA</span>
-            <strong>{formatCoordinate(view.center.raDeg, "RA")}</strong>
-          </div>
-          <div className={styles.coordinateRow}>
-            <span>DEC</span>
-            <strong>{formatCoordinate(view.center.decDeg, "DEC")}</strong>
-          </div>
-          <div className={styles.readoutDivider} />
-          <div className={styles.coordinateRow}>
-            <span>FIELD</span>
-            <strong>{view.fieldOfViewDeg.toFixed(1)}°</strong>
-          </div>
-        </section>
+        {showSurveyPicker && surveyPreferenceReady && (
+          <section className={styles.surveyPicker} aria-label="Choose a sky survey">
+            <div className={styles.pickerHeading}>
+              <p className={styles.panelEyebrow}>PICK YOUR SKY</p>
+              <span>Choose the background atlas</span>
+            </div>
+            {(Object.entries(SURVEYS) as [SurveyId, (typeof SURVEYS)[SurveyId]][]).map(
+              ([id, survey]) => (
+                <button
+                  className={styles.surveyOption}
+                  type="button"
+                  key={id}
+                  onClick={() => handleSurveyChange(id)}
+                >
+                  <span className={styles.surveyOptionGlyph} aria-hidden="true">
+                    {id === "optical" ? "◉" : "◌"}
+                  </span>
+                  <span>
+                    <strong>{survey.label}</strong>
+                    <small>{survey.detail}</small>
+                  </span>
+                  <span className={styles.optionArrow} aria-hidden="true">↗</span>
+                </button>
+              ),
+            )}
+            <p className={styles.pickerNote}>You can switch surveys at any time.</p>
+          </section>
+        )}
 
-        <section className={styles.layerPanel} aria-label="Viewport layers">
-          <div className={styles.panelTitle}>
-            <span className={styles.layerGlyph} />
-            <span>SKY LAYERS</span>
-          </div>
-          <div className={styles.layerRow}>
-            <span className={styles.layerSwatch} />
-            <span>Illustrative starfield</span>
-            <span className={styles.layerState}>VISUAL</span>
-          </div>
-          <div className={styles.layerRow}>
-            <span className={`${styles.layerSwatch} ${styles.footprintSwatch}`} />
-            <span>Observation footprints</span>
-            <span className={styles.layerState}>{safeFootprints.length}</span>
-          </div>
-          <p className={styles.layerNote}>Archive footprints appear when supplied by the parent view.</p>
-        </section>
-
-        <nav className={styles.navControls} aria-label="Sky navigation controls">
-          <span className={styles.controlLabel}>VIEW CONTROLS</span>
-          <button type="button" onClick={zoomIn} aria-label="Zoom in" title="Zoom in">
-            <span aria-hidden="true">+</span>
+        <nav className={styles.controlDock} aria-label="Sky map controls">
+          <span className={styles.controlLabel}>NAVIGATE</span>
+          <button type="button" aria-label="Zoom in" title="Zoom in" disabled={mapControlsDisabled} onClick={() => mapRef.current?.increaseZoom()}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
           </button>
-          <button type="button" onClick={zoomOut} aria-label="Zoom out" title="Zoom out">
-            <span aria-hidden="true">−</span>
+          <button type="button" aria-label="Zoom out" title="Zoom out" disabled={mapControlsDisabled} onClick={() => mapRef.current?.decreaseZoom()}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12" /></svg>
           </button>
-          <button type="button" onClick={resetView} aria-label="Reset sky view" title="Reset sky view">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 11.8a8 8 0 1 1 2.2 5.5M4 6.2v5.6h5.6" />
-            </svg>
+          <span className={styles.dockDivider} aria-hidden="true" />
+          <button
+            className={gridVisible ? styles.controlActive : ""}
+            type="button"
+            aria-label={gridVisible ? "Hide coordinate grid" : "Show coordinate grid"}
+            aria-pressed={gridVisible}
+            title={gridVisible ? "Hide coordinate grid" : "Show coordinate grid"}
+            disabled={mapControlsDisabled}
+            onClick={() => {
+              const nextGridVisible = !gridVisible;
+              setGridVisible(nextGridVisible);
+              mapRef.current?.setCooGrid({ enabled: nextGridVisible, color: "#83c6d8", opacity: 0.34, thickness: 1, labelSize: 11 });
+            }}
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.8" /><path d="M3.7 10h12.6M10 3.2v13.6M5.1 5.3c2.9 2 6.9 2 9.8 0M5.1 14.7c2.9-2 6.9-2 9.8 0" /></svg>
+          </button>
+          <span className={styles.dockDivider} aria-hidden="true" />
+          <button
+            className={showLocalStarfield ? styles.controlActive : ""}
+            type="button"
+            aria-label={showLocalStarfield ? "Local starfield active" : "Use local starfield fallback"}
+            aria-pressed={showLocalStarfield}
+            title={mapStatus === "fallback" ? "Survey atlas unavailable; local starfield active" : showLocalStarfield ? "Return to live sky survey" : "Use local starfield fallback"}
+            disabled={mapStatus === "fallback"}
+            onClick={() => setLocalStarfieldRequested((isRequested) => !isRequested)}
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2.8 1.45 4.25 4.25 1.45-4.25 1.45L10 14.2l-1.45-4.25L4.3 8.5l4.25-1.45L10 2.8Z" /><path d="m15.6 12.4.7 2.05 2.05.7-2.05.7-.7 2.05-.7-2.05-2.05-.7 2.05-.7.7-2.05Z" /></svg>
+          </button>
+          <button type="button" aria-label="Return to SPHEREx demo field" title="Return to demo field" onClick={resetView}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 1 0 1.7-4.2L4 7.5M4 4v3.5h3.5" /></svg>
           </button>
         </nav>
 
-        <footer className={styles.bottomConsole}>
-          <div className={styles.consoleEdge} aria-hidden="true" />
-          <div className={styles.consoleHint}>
-            <span className={styles.inputGlyph} aria-hidden="true">⌖</span>
-            <span><strong>DRAG</strong> to look around</span>
+        <aside className={styles.coordinateReadout} aria-live="polite" aria-label="Current sky coordinates">
+          <div className={styles.readoutHeading}>
+            <span className={styles.liveDot} aria-hidden="true" />
+            <span>RETICLE COORDINATES</span>
           </div>
-          <span className={styles.consoleDivider} aria-hidden="true" />
-          <div className={styles.consoleHint}>
-            <span className={styles.wheelGlyph} aria-hidden="true">↕</span>
-            <span><strong>SCROLL</strong> to adjust field</span>
+          <div className={styles.coordinateRows}>
+            <span>RA <strong>{formatCoordinate(view.center.raDeg, "RA")}</strong></span>
+            <span>DEC <strong>{formatCoordinate(view.center.decDeg, "DEC")}</strong></span>
+            <span>FIELD <strong>{view.fieldOfViewDeg.toFixed(2)}°</strong></span>
           </div>
-          <span className={styles.consoleDivider} aria-hidden="true" />
-          <div className={styles.consoleHint}>
-            <span className={styles.centerGlyph} aria-hidden="true">◎</span>
-            <span>Crosshair stays centered</span>
-          </div>
-          <span className={styles.consoleTip}>ARROWS TO PAN · +/- TO ZOOM · HOME TO RESET</span>
-        </footer>
+        </aside>
 
-        <div className={styles.ambientLabel} aria-hidden="true">
-          <span>VIEWPORT</span>
-          <span className={styles.ambientLine} />
-          <span>360° CELESTIAL SPHERE</span>
+        <div className={styles.navigationHint}>
+          <span className={styles.hintGlyph} aria-hidden="true">⌖</span>
+          <span><strong>DRAG</strong> to pan</span>
+          <span className={styles.hintSeparator} aria-hidden="true" />
+          <span><strong>SCROLL / PINCH</strong> to zoom</span>
+          <span className={styles.hintKeyboard}>ARROWS TO NAVIGATE · +/- TO ZOOM · HOME TO RESET</span>
         </div>
-      </div>
-      <span className={styles.srOnly} role="status">
-        {viewportStatus === "loading" ? "Loading 3D sky viewport" : "3D sky viewport ready"}
-      </span>
+
+        <a
+          className={styles.attribution}
+          href="https://aladin.cds.unistra.fr/AladinLite/"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="Sky atlas by Aladin Lite, opens in a new tab"
+        >
+          SKY ATLAS BY <strong>ALADIN LITE</strong>
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2h6v6M10 2 5 7M9 7v3H2V3h3" /></svg>
+        </a>
+
+        {mapStatus === "loading" && !showLocalStarfield && (
+          <div className={styles.mapStatus} role="status" aria-live="polite">
+            <span className={styles.spinner} aria-hidden="true" />
+            <span>Opening the sky atlas…</span>
+          </div>
+        )}
+        {showLocalStarfield && (
+          <div className={styles.fallbackMessage} role="status">
+            <p className={styles.panelEyebrow}>LOCAL SKY VIEW</p>
+            <strong>{mapStatus === "fallback" ? "Survey atlas unavailable" : "Local starfield preview"}</strong>
+            <span>{mapStatus === "fallback" ? "The live survey could not start. The SPHEREx comparison remains available; reload to try the atlas again." : "Showing the cockpit’s local starfield. Return to the survey map to continue exploring."}</span>
+          </div>
+        )}
+
+        {mapStatus !== "loading" && activeFootprintIsDemo && visibleSelectedFootprintId && (
+          <SpherexComparison center={DEMO_CENTER} onClose={() => {
+            selectedFootprintIdRef.current = null;
+            setSelectedFootprintId(null);
+          }} />
+        )}
+
+        <span className={styles.srOnly} role="status">
+          {mapStatus === "loading" ? "Loading the Aladin sky atlas" : mapStatus === "ready" ? "Sky atlas ready" : "Sky atlas unavailable; local comparison remains available"}
+        </span>
+      </section>
     </main>
   );
 }
