@@ -21,7 +21,8 @@ export default function SpherexComparison({
   onClose,
 }: SpherexComparisonProps) {
   const [split, setSplit] = useState(50);
-  const [earlier, later] = SPHEREX_DEMO_OBSERVATIONS;
+  const earlier = SPHEREX_DEMO_OBSERVATIONS.find((observation) => observation.id === "spherex-2025-05-03")!;
+  const later = SPHEREX_DEMO_OBSERVATIONS.find((observation) => observation.id === "spherex-2025-05-22")!;
 
   return (
     <section className={styles.panel} aria-label="SPHEREx observation inspector">
@@ -47,7 +48,7 @@ export default function SpherexComparison({
         <div
           className={styles.frame}
           role="img"
-          aria-label={`Aligned SPHEREx D1 intensity images from ${earlier.date} and ${later.date}. Move the comparison control to reveal each observation.`}
+          aria-label={`Aligned SPHEREx D1 intensity images from ${earlier.dateLabel} and ${later.dateLabel}. Move the comparison control to reveal each observation.`}
         >
           <Image
             className={styles.image}
@@ -76,8 +77,8 @@ export default function SpherexComparison({
           </span>
         </div>
         <figcaption className={styles.dateLabels}>
-          <span>{earlier.date}</span>
-          <span>{later.date}</span>
+          <span>{earlier.dateLabel}</span>
+          <span>{later.dateLabel}</span>
         </figcaption>
       </figure>
 
@@ -100,8 +101,8 @@ export default function SpherexComparison({
         min="0"
         max="100"
         value={split}
-        aria-label={`Reveal ${later.date} from right to left; ${earlier.date} remains on the left`}
-        aria-valuetext={`${split}% of the comparison reveals the ${later.date} observation`}
+        aria-label={`Reveal ${later.dateLabel} from right to left; ${earlier.dateLabel} remains on the left`}
+        aria-valuetext={`${split}% of the comparison reveals the ${later.dateLabel} observation`}
         onChange={(event) => setSplit(Number(event.currentTarget.value))}
       />
 

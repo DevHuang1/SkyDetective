@@ -4,19 +4,24 @@ import Script from "next/script";
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import SpherexComparison from "./spherex-comparison";
+import ArchiveExplorer from "./archive-explorer";
 import {
   DEMO_CENTER,
+  DEMO_FOOTPRINT,
   DEMO_FIELD_OF_VIEW_DEG,
   DEMO_FOOTPRINT_ID,
   DEMO_FOOTPRINTS,
+  SPHEREX_DEMO_OBSERVATIONS,
 } from "./spherex-demo";
 import type { SkyCoordinate, SkyFootprint, SkyViewState } from "./sky-types";
+import type { ArchiveMode, KnownObjectCheck, SavedCandidate, SkyObservation, SkyRegion } from "../lib/archive-types";
+import { regionAsFootprint } from "../lib/archive-types";
 import styles from "./sky-viewport.module.css";
 
 export type { SkyCoordinate, SkyFootprint, SkyViewState } from "./sky-types";
@@ -87,6 +92,21 @@ const SURVEY_STORAGE_KEY = "skydetective.base-survey";
 const ALADIN_SCRIPT = "https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js";
 const MIN_FIELD_OF_VIEW = 0.03;
 const MAX_FIELD_OF_VIEW = 120;
+const CANDIDATE_STORAGE_KEY = "skydetective.candidates.v1";
+
+const LOCAL_DEMO_OBSERVATIONS: SkyObservation[] = SPHEREX_DEMO_OBSERVATIONS.map((observation) => ({
+  id: observation.id,
+  survey: "SPHEREx QR2",
+  date: observation.date,
+  dateLabel: observation.dateLabel,
+  band: "D1",
+  bandLabel: "D1 · 0.75–1.09 μm",
+  productName: observation.id,
+  footprint: { ...DEMO_FOOTPRINT, id: "obs:" + observation.id, kind: "demo" },
+  previewUrl: observation.image,
+  accessUrl: null,
+  source: "demo",
+}));
 
 function normalizeCoordinate(coordinate: SkyCoordinate): SkyCoordinate {
   const ra = Number.isFinite(coordinate.raDeg) ? coordinate.raDeg : 0;
@@ -159,6 +179,50 @@ function formatCoordinate(value: number, kind: "RA" | "DEC") {
   return `${sign}${value.toFixed(3)}°`;
 }
 
+function sphericalCenter(vertices: readonly SkyCoordinate[]): SkyCoordinate {
+  const vector = vertices.reduce(
+    (sum, point) => {
+      const ra = (point.raDeg * Math.PI) / 180;
+      const dec = (point.decDeg * Math.PI) / 180;
+      sum[0] += Math.cos(dec) * Math.cos(ra);
+      sum[1] += Math.cos(dec) * Math.sin(ra);
+      sum[2] += Math.sin(dec);
+      return sum;
+    },
+    [0, 0, 0],
+  );
+  return normalizeCoordinate({
+    raDeg: (Math.atan2(vector[1], vector[0]) * 180) / Math.PI,
+    decDeg: (Math.atan2(vector[2], Math.hypot(vector[0], vector[1])) * 180) / Math.PI,
+  });
+}
+
+function regionDimensions(vertices: readonly SkyCoordinate[], center: SkyCoordinate) {
+  const decRadians = (center.decDeg * Math.PI) / 180;
+  let halfWidth = 0;
+  let halfHeight = 0;
+  for (const point of vertices) {
+    const deltaRa = ((((point.raDeg - center.raDeg) % 360) + 540) % 360) - 180;
+    halfWidth = Math.max(halfWidth, Math.abs(deltaRa * Math.cos(decRadians)));
+    halfHeight = Math.max(halfHeight, Math.abs(point.decDeg - center.decDeg));
+  }
+  return { widthDeg: Math.max(0.01, halfWidth * 2), heightDeg: Math.max(0.01, halfHeight * 2) };
+}
+
+function tangentOffset(center: SkyCoordinate, eastDeg: number, northDeg: number): SkyCoordinate {
+  const dec0 = (center.decDeg * Math.PI) / 180;
+  const xi = (eastDeg * Math.PI) / 180;
+  const eta = (northDeg * Math.PI) / 180;
+  const denominator = Math.cos(dec0) - eta * Math.sin(dec0);
+  return normalizeCoordinate({
+    raDeg: center.raDeg + (Math.atan2(xi, denominator) * 180) / Math.PI,
+    decDeg: (Math.atan2(
+      Math.sin(dec0) + eta * Math.cos(dec0),
+      Math.sqrt(denominator * denominator + xi * xi),
+    ) * 180) / Math.PI,
+  });
+}
+
 function createFootprintOverlay(
   api: AladinGlobal,
   map: AladinInstance,
@@ -174,15 +238,18 @@ function createFootprintOverlay(
   for (const footprint of footprints) {
     if (footprint.vertices.length < 3) continue;
     const selected = footprint.id === selectedId;
+    const isRegion = footprint.kind === "region";
+    const isObservation = footprint.kind === "observation";
+    const color = isRegion ? "#f3bb70" : isObservation ? "#86bfd2" : "#67d9ee";
     const vertices = footprint.vertices.map(
       ({ raDeg, decDeg }) => [raDeg, decDeg] as const,
     );
     const polygon = api.polygon(vertices, {
-      color: selected ? "#ffd18a" : "#67d9ee",
-      fill: true,
-      fillColor: selected ? "#ffd18a" : "#67d9ee",
-      opacity: selected ? 0.14 : 0.07,
-      lineWidth: selected ? 3 : 2,
+      color: selected ? "#fff0c8" : color,
+      fill: !isObservation || selected,
+      fillColor: selected ? "#ffd18a" : color,
+      opacity: selected ? 0.11 : isRegion ? 0.04 : 0.025,
+      lineWidth: selected || isRegion ? 3 : isObservation ? 1 : 2,
       selectionColor: "#fff0cc",
       hoverColor: "#ffffff",
     });
@@ -210,33 +277,53 @@ export default function SkyViewport({
   const apiRef = useRef<AladinGlobal | null>(null);
   const overlayRef = useRef<AladinOverlay | null>(null);
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
+  const areaPointerRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onViewSettledRef = useRef(onViewSettled);
   const onFootprintSelectRef = useRef(onFootprintSelect);
   const selectedFootprintIdRef = useRef<string | null>(null);
   const appliedSurveyRef = useRef<SurveyId | null>(null);
   const footprintsRef = useRef(footprints);
+  const archiveRequestIdRef = useRef(0);
 
   const [scriptReady, setScriptReady] = useState(false);
   const [surveyPreferenceReady, setSurveyPreferenceReady] = useState(false);
   const [surveyChoice, setSurveyChoice] = useState<SurveyId>("optical");
   const [showSurveyPicker, setShowSurveyPicker] = useState(false);
   const [mapStatus, setMapStatus] = useState<"loading" | "ready" | "fallback">("loading");
-  const [localStarfieldRequested, setLocalStarfieldRequested] = useState(false);
   const [selectedFootprintId, setSelectedFootprintId] = useState<string | null>(null);
   const [gridVisible, setGridVisible] = useState(true);
+  const [mode, setMode] = useState<ArchiveMode>("spherex");
+  const [isSelectingArea, setIsSelectingArea] = useState(false);
+  const [selectionBox, setSelectionBox] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<SkyRegion | null>(null);
+  const [archiveObservations, setArchiveObservations] = useState<SkyObservation[]>(LOCAL_DEMO_OBSERVATIONS);
+  const [activeObservationIndex, setActiveObservationIndex] = useState(LOCAL_DEMO_OBSERVATIONS.length - 1);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveMessage, setArchiveMessage] = useState("Local SPHEREx D1 samples are ready. Select an area to search IRSA.");
+  const [isArchiveData, setIsArchiveData] = useState(false);
+  const [archivePanelOpen, setArchivePanelOpen] = useState(false);
+  const [candidatePosition, setCandidatePosition] = useState<SkyCoordinate>(requestedCenter);
+  const [candidates, setCandidates] = useState<SavedCandidate[]>([]);
+  const [candidateStoreReady, setCandidateStoreReady] = useState(false);
   const [view, setView] = useState<SkyViewState>(() => ({
     center: requestedCenter,
     fieldOfViewDeg: requestedFov,
   }));
   const hasControlledCenter = viewCenter !== undefined;
-  const visibleSelectedFootprintId = footprints.some(
+  const displayFootprints = useMemo(() => {
+    const regionFootprints = selectedRegion ? [regionAsFootprint(selectedRegion)] : [];
+    const observationFootprints = archiveObservations
+      .filter((observation) => observation.source === "archive")
+      .map((observation) => observation.footprint);
+    return [...footprints, ...regionFootprints, ...observationFootprints];
+  }, [archiveObservations, footprints, selectedRegion]);
+  const visibleSelectedFootprintId = displayFootprints.some(
     (footprint) => footprint.id === selectedFootprintId,
   )
     ? selectedFootprintId
     : null;
-  const showLocalStarfield = localStarfieldRequested || mapStatus === "fallback";
-  const mapControlsDisabled = mapStatus !== "ready" || showLocalStarfield;
+  const mapControlsDisabled = mapStatus !== "ready";
 
   useEffect(() => {
     onViewSettledRef.current = onViewSettled;
@@ -244,8 +331,8 @@ export default function SkyViewport({
   }, [onFootprintSelect, onViewSettled]);
 
   useEffect(() => {
-    footprintsRef.current = footprints;
-  }, [footprints]);
+    footprintsRef.current = displayFootprints;
+  }, [displayFootprints]);
 
   useEffect(() => {
     let cancelled = false;
@@ -275,6 +362,22 @@ export default function SkyViewport({
     };
   }, []);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const stored = window.localStorage.getItem(CANDIDATE_STORAGE_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored) as SavedCandidate[];
+          if (Array.isArray(parsed)) setCandidates(parsed);
+        }
+      } catch {
+        // Candidate review remains available for this session without browser storage.
+      }
+      setCandidateStoreReady(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   const updateViewFromMap = useCallback((map: AladinInstance) => {
     const [raDeg, decDeg] = map.getRaDec();
     const [mapFov] = map.getFoV();
@@ -296,12 +399,154 @@ export default function SkyViewport({
     [updateViewFromMap],
   );
 
+  const searchArchive = useCallback(async (searchMode: ArchiveMode, region: SkyRegion) => {
+    const requestId = ++archiveRequestIdRef.current;
+    setArchivePanelOpen(true);
+    setArchiveBusy(true);
+    setArchiveObservations(LOCAL_DEMO_OBSERVATIONS);
+    setActiveObservationIndex(LOCAL_DEMO_OBSERVATIONS.length - 1);
+    setIsArchiveData(false);
+    setArchiveMessage("Searching IRSA for overlapping observations…");
+    try {
+      const response = await fetch("/api/archive/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: searchMode, region }),
+      });
+      const payload = await response.json() as {
+        observations?: SkyObservation[];
+        message?: string;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(payload.error || "IRSA archive search failed.");
+      if (requestId !== archiveRequestIdRef.current) return;
+      const results = Array.isArray(payload.observations) ? payload.observations : [];
+      if (results.length) {
+        setArchiveObservations(results);
+        setActiveObservationIndex(results.length - 1);
+        setIsArchiveData(true);
+        setArchiveMessage("Loaded " + results.length + " overlapping " + (searchMode === "spherex" ? "SPHEREx D1" : "NEOWISE") + " archive observations.");
+      } else {
+        setArchiveObservations(LOCAL_DEMO_OBSERVATIONS);
+        setActiveObservationIndex(LOCAL_DEMO_OBSERVATIONS.length - 1);
+        setIsArchiveData(false);
+        setArchiveMessage((payload.message || "No archive observations cover this area.") + " Showing the local visual sample for exploration.");
+      }
+    } catch (error) {
+      if (requestId !== archiveRequestIdRef.current) return;
+      setArchiveObservations(LOCAL_DEMO_OBSERVATIONS);
+      setActiveObservationIndex(LOCAL_DEMO_OBSERVATIONS.length - 1);
+      setIsArchiveData(false);
+      setArchiveMessage((error instanceof Error ? error.message : "Archive request failed.") + " Showing the local visual sample; it is not archive data.");
+    } finally {
+      if (requestId === archiveRequestIdRef.current) setArchiveBusy(false);
+    }
+  }, []);
+
+  const changeMode = useCallback((nextMode: ArchiveMode) => {
+    setMode(nextMode);
+    setArchivePanelOpen(true);
+    if (selectedRegion) {
+      void searchArchive(nextMode, selectedRegion);
+    } else {
+      setArchiveObservations(LOCAL_DEMO_OBSERVATIONS);
+      setActiveObservationIndex(LOCAL_DEMO_OBSERVATIONS.length - 1);
+      setIsArchiveData(false);
+      setArchiveBusy(false);
+      setArchiveMessage(nextMode === "spherex"
+        ? "Local SPHEREx D1 samples are ready. Select an area to search IRSA."
+        : "Local SPHEREx images show the comparison controls only; draw an area to search NEOWISE.");
+    }
+  }, [searchArchive, selectedRegion]);
+
+  const saveCandidate = useCallback((knownObjectCheck: KnownObjectCheck, observationIds: string[]) => {
+    if (!selectedRegion || !candidateStoreReady) return;
+    const candidate: SavedCandidate = {
+      id: typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : "candidate-" + Date.now(),
+      createdAt: new Date().toISOString(),
+      mode: "planetx",
+      coordinate: normalizeCoordinate(candidatePosition),
+      region: selectedRegion,
+      observationIds,
+      note: "",
+      knownObjectCheck,
+    };
+    setCandidates((current) => {
+      const next = [candidate, ...current];
+      try {
+        window.localStorage.setItem(CANDIDATE_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Keep the saved flag in memory if browser storage is full or unavailable.
+      }
+      return next;
+    });
+  }, [candidatePosition, candidateStoreReady, selectedRegion]);
+
+  const exportCandidates = useCallback(() => {
+    if (!candidates.length) return;
+    const columns = ["created_at_utc", "ra_deg", "dec_deg", "known_object_status", "known_object_matches", "observation_ids", "region_vertices"];
+    const escapeCell = (value: string) => '"' + value.replaceAll('"', '""') + '"';
+    const rows = candidates.map((candidate) => [
+      candidate.createdAt,
+      candidate.coordinate.raDeg.toFixed(7),
+      candidate.coordinate.decDeg.toFixed(7),
+      candidate.knownObjectCheck.status,
+      candidate.knownObjectCheck.matches.map((match) => match.designation).join("; "),
+      candidate.observationIds.join("; "),
+      JSON.stringify(candidate.region.vertices),
+    ].map(escapeCell).join(","));
+    const blob = new Blob([columns.join(",") + "\n" + rows.join("\n")], { type: "text/csv;charset=utf-8" });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = "skydetective-candidates.csv";
+    link.click();
+    URL.revokeObjectURL(objectUrl);
+  }, [candidates]);
+
+  const checkKnownObjects = useCallback(async (observationId: string): Promise<KnownObjectCheck> => {
+    if (!selectedRegion || !archiveObservations.length || !isArchiveData) {
+      return { status: "unavailable", matches: [], message: "Load a real archive observation before checking known objects." };
+    }
+    const center = sphericalCenter(selectedRegion.vertices);
+    const dimensions = regionDimensions(selectedRegion.vertices, center);
+    const observation = archiveObservations.find((entry) => entry.id === observationId);
+    if (!observation) {
+      return { status: "unavailable", matches: [], message: "The selected observation is no longer available." };
+    }
+    try {
+      const response = await fetch("/api/archive/known-objects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ center, date: observation.date, ...dimensions }),
+      });
+      const result = await response.json() as KnownObjectCheck;
+      return result.status ? result : {
+        status: "unavailable",
+        matches: [],
+        message: "JPL returned an unreadable response. This is not a no-match result.",
+      };
+    } catch {
+      return {
+        status: "unavailable",
+        matches: [],
+        message: "JPL cross-check is unavailable. This is not a no-match result.",
+      };
+    }
+  }, [archiveObservations, isArchiveData, selectedRegion]);
+
   const selectFootprint = useCallback((id: string) => {
-    if (selectedFootprintIdRef.current === id) return;
     selectedFootprintIdRef.current = id;
     setSelectedFootprintId(id);
+    if (id === DEMO_FOOTPRINT_ID || id.startsWith("obs:") || id === selectedRegion?.id) {
+      setArchivePanelOpen(true);
+    }
+    const observationIndex = archiveObservations.findIndex((observation) => "obs:" + observation.id === id);
+    if (observationIndex >= 0) setActiveObservationIndex(observationIndex);
     onFootprintSelectRef.current?.(id);
-  }, []);
+  }, [archiveObservations, selectedRegion]);
 
   useEffect(() => {
     const mapHost = mapHostRef.current;
@@ -418,13 +663,13 @@ export default function SkyViewport({
     if (!map || !api || mapStatus !== "ready") return;
 
     if (overlayRef.current) map.removeOverlay(overlayRef.current);
-    overlayRef.current = createFootprintOverlay(api, map, footprints, visibleSelectedFootprintId);
+    overlayRef.current = createFootprintOverlay(api, map, displayFootprints, visibleSelectedFootprintId);
 
     return () => {
       if (overlayRef.current) map.removeOverlay(overlayRef.current);
       overlayRef.current = null;
     };
-  }, [footprints, mapStatus, visibleSelectedFootprintId]);
+  }, [displayFootprints, mapStatus, visibleSelectedFootprintId]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -465,26 +710,127 @@ export default function SkyViewport({
     setView({ center: requestedCenter, fieldOfViewDeg: requestedFov });
   }, [requestedCenter, requestedFov]);
 
+  const selectCurrentView = useCallback(() => {
+    const center = view.center;
+    const halfWidth = Math.min(view.fieldOfViewDeg * 0.25, 4);
+    const halfHeight = halfWidth * 0.75;
+    const region: SkyRegion = {
+      id: "selected-area",
+      vertices: [
+        tangentOffset(center, -halfWidth, halfHeight),
+        tangentOffset(center, halfWidth, halfHeight),
+        tangentOffset(center, halfWidth, -halfHeight),
+        tangentOffset(center, -halfWidth, -halfHeight),
+      ],
+    };
+    setSelectedRegion(region);
+    setCandidatePosition(sphericalCenter(region.vertices));
+    setSelectedFootprintId(region.id);
+    selectedFootprintIdRef.current = region.id;
+    setArchivePanelOpen(true);
+    setIsSelectingArea(false);
+    setSelectionBox(null);
+    void searchArchive(mode, region);
+  }, [mode, searchArchive, view.center, view.fieldOfViewDeg]);
+
+  const updateCandidatePosition = useCallback((position: SkyCoordinate) => {
+    setCandidatePosition({
+      raDeg: Number.isFinite(position.raDeg) ? ((position.raDeg % 360) + 360) % 360 : 0,
+      decDeg: Number.isFinite(position.decDeg) ? Math.max(-90, Math.min(90, position.decDeg)) : 0,
+    });
+  }, []);
+
+  const closeArchivePanel = useCallback(() => {
+    setArchivePanelOpen(false);
+    selectedFootprintIdRef.current = null;
+    setSelectedFootprintId(null);
+  }, []);
+
   const selectFootprintAt = useCallback(
     (coordinate: SkyCoordinate) => {
-      const match = footprints.find((footprint) =>
+      const match = displayFootprints.find((footprint) =>
         pointInSphericalPolygon(coordinate, footprint.vertices),
       );
       if (match) selectFootprint(match.id);
     },
-    [footprints, selectFootprint],
+    [displayFootprints, selectFootprint],
   );
 
   const handleMapPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (isSelectingArea && event.button === 0) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      areaPointerRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+      const bounds = event.currentTarget.getBoundingClientRect();
+      setSelectionBox({
+        left: event.clientX - bounds.left,
+        top: event.clientY - bounds.top,
+        width: 0,
+        height: 0,
+      });
+      pointerStartRef.current = null;
+      return;
+    }
     if (event.button !== 0 || event.target instanceof Element && event.target.closest(".aladin-status-bar")) {
       pointerStartRef.current = null;
       return;
     }
     pointerStartRef.current = { x: event.clientX, y: event.clientY };
+  }, [isSelectingArea]);
+
+  const handleMapPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = areaPointerRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const left = Math.min(start.x, event.clientX) - bounds.left;
+    const top = Math.min(start.y, event.clientY) - bounds.top;
+    setSelectionBox({
+      left,
+      top,
+      width: Math.abs(event.clientX - start.x),
+      height: Math.abs(event.clientY - start.y),
+    });
   }, []);
 
   const handleMapPointerUp = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
+      const areaStart = areaPointerRef.current;
+      if (areaStart && areaStart.pointerId === event.pointerId) {
+        event.preventDefault();
+        event.stopPropagation();
+        areaPointerRef.current = null;
+        pointerStartRef.current = null;
+        const map = mapRef.current;
+        const host = mapHostRef.current;
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const left = Math.min(areaStart.x, event.clientX);
+        const right = Math.max(areaStart.x, event.clientX);
+        const top = Math.min(areaStart.y, event.clientY);
+        const bottom = Math.max(areaStart.y, event.clientY);
+        setSelectionBox(null);
+        setIsSelectingArea(false);
+        if (!map || !host || right - left < 12 || bottom - top < 12) return;
+        const positions = [
+          map.pix2world(left - bounds.left, top - bounds.top, "ICRS"),
+          map.pix2world(right - bounds.left, top - bounds.top, "ICRS"),
+          map.pix2world(right - bounds.left, bottom - bounds.top, "ICRS"),
+          map.pix2world(left - bounds.left, bottom - bounds.top, "ICRS"),
+        ];
+        const vertices = positions.map(([raDeg, decDeg]) => normalizeCoordinate({ raDeg, decDeg }));
+        if (vertices.some((point) => !Number.isFinite(point.raDeg) || !Number.isFinite(point.decDeg))) return;
+        const region: SkyRegion = { id: "selected-area", vertices };
+        const center = sphericalCenter(vertices);
+        setSelectedRegion(region);
+        setCandidatePosition(center);
+        setSelectedFootprintId(region.id);
+        selectedFootprintIdRef.current = region.id;
+        setArchivePanelOpen(true);
+        void searchArchive(mode, region);
+        return;
+      }
       const start = pointerStartRef.current;
       pointerStartRef.current = null;
       const map = mapRef.current;
@@ -498,11 +844,18 @@ export default function SkyViewport({
         selectFootprintAt({ raDeg, decDeg });
       }
     },
-    [selectFootprintAt],
+    [mode, searchArchive, selectFootprintAt],
   );
 
   const handleMapKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "Escape" && isSelectingArea) {
+        event.preventDefault();
+        areaPointerRef.current = null;
+        setIsSelectingArea(false);
+        setSelectionBox(null);
+        return;
+      }
       const map = mapRef.current;
       if (!map) return;
       const [raDeg, decDeg] = map.getRaDec();
@@ -554,10 +907,11 @@ export default function SkyViewport({
       map.gotoRaDec(normalizeCoordinate(next).raDeg, normalizeCoordinate(next).decDeg);
       scheduleViewSettled(map);
     },
-    [resetView, scheduleViewSettled, selectFootprintAt],
+    [isSelectingArea, resetView, scheduleViewSettled, selectFootprintAt],
   );
 
   const activeFootprintIsDemo = visibleSelectedFootprintId === DEMO_FOOTPRINT_ID;
+  const showArchiveExplorer = archivePanelOpen || activeFootprintIsDemo;
 
   return (
     <main className={styles.cockpit}>
@@ -569,22 +923,39 @@ export default function SkyViewport({
         onError={() => setMapStatus("fallback")}
       />
 
-      <section className={styles.viewport} aria-label="Interactive SPHEREx sky atlas">
+      <section className={styles.viewport} aria-label="Interactive sky atlas for SPHEREx and Planet X candidate review">
         <div className={styles.starfieldFallback} aria-hidden="true" />
         <div
-          className={`${styles.mapHost} ${showLocalStarfield ? styles.mapHidden : ""}`}
+          className={`${styles.mapHost} ${mapStatus === "fallback" ? styles.mapHidden : ""}`}
           ref={mapHostRef}
           role="application"
           tabIndex={0}
-          aria-label="Interactive sky map. Drag or swipe to pan, scroll or pinch to zoom, use the arrow keys to navigate, plus and minus to zoom, and Home to return to the SPHEREx demo field."
-          aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown + - Home Enter"
+          aria-label={isSelectingArea
+            ? "Draw a rectangle on the sky map to choose the exact search area. Press Escape to cancel."
+            : "Interactive sky map. Drag or swipe to pan, scroll or pinch to zoom, use the arrow keys to navigate, plus and minus to zoom, and Home to return to the demo field."}
+          aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown + - Home Enter Escape"
           onKeyDown={handleMapKeyDown}
           onPointerDownCapture={handleMapPointerDown}
+          onPointerMoveCapture={handleMapPointerMove}
           onPointerUpCapture={handleMapPointerUp}
           onPointerCancelCapture={() => {
+            areaPointerRef.current = null;
             pointerStartRef.current = null;
+            setSelectionBox(null);
           }}
         />
+        {selectionBox && (
+          <div
+            className={styles.selectionBox}
+            aria-hidden="true"
+            style={{
+              left: selectionBox.left,
+              top: selectionBox.top,
+              width: selectionBox.width,
+              height: selectionBox.height,
+            }}
+          />
+        )}
         <div className={styles.viewportShade} aria-hidden="true" />
         <div className={styles.canopy} aria-hidden="true" />
 
@@ -601,12 +972,26 @@ export default function SkyViewport({
               <span />
             </span>
             <div>
-              <p className={styles.kicker}>FLIGHT DECK · SPHEREx ARCHIVE</p>
+              <p className={styles.kicker}>FLIGHT DECK · DEEP SKY</p>
               <h1>SkyDetective</h1>
             </div>
           </div>
 
           <div className={styles.topActions}>
+            <div className={styles.modeSwitch} role="group" aria-label="Choose research mode">
+              <button
+                type="button"
+                className={mode === "spherex" ? styles.modeActive : ""}
+                aria-pressed={mode === "spherex"}
+                onClick={() => changeMode("spherex")}
+              >SPHEREx</button>
+              <button
+                type="button"
+                className={mode === "planetx" ? styles.modeActive : ""}
+                aria-pressed={mode === "planetx"}
+                onClick={() => changeMode("planetx")}
+              >Planet X</button>
+            </div>
             <label className={styles.surveySelect}>
               <span>SKY SURVEY</span>
               <select
@@ -620,21 +1005,44 @@ export default function SkyViewport({
               </select>
             </label>
             <button
+              className={isSelectingArea ? styles.selectAreaActive : styles.selectAreaButton}
+              type="button"
+              aria-pressed={isSelectingArea}
+              onClick={() => {
+                const nextSelection = !isSelectingArea;
+                setIsSelectingArea(nextSelection);
+                setSelectionBox(null);
+                setArchivePanelOpen(false);
+                if (nextSelection) mapHostRef.current?.focus();
+              }}
+              disabled={mapStatus !== "ready"}
+            >
+              {isSelectingArea ? "Cancel area" : "Select area"}
+            </button>
+            <button
               className={styles.compareButton}
               type="button"
               onClick={() => {
-                const demoFootprint = footprints.find((footprint) => footprint.id === DEMO_FOOTPRINT_ID);
+                const demoFootprint = displayFootprints.find((footprint) => footprint.id === DEMO_FOOTPRINT_ID);
                 if (demoFootprint) selectFootprint(demoFootprint.id);
               }}
-              disabled={!footprints.some((footprint) => footprint.id === DEMO_FOOTPRINT_ID)}
+              disabled={!displayFootprints.some((footprint) => footprint.id === DEMO_FOOTPRINT_ID)}
             >
               <svg viewBox="0 0 20 20" aria-hidden="true">
                 <path d="M3 4.5h14M3 10h14M3 15.5h14M7 2v16m6-16v16" />
               </svg>
-              Compare dates
+              Demo
             </button>
           </div>
         </header>
+
+        {isSelectingArea && (
+          <div className={styles.selectionHint} role="status">
+            <strong>SELECT A SKY AREA</strong>
+            <span>Drag a rectangle across the map. Touch works too.</span>
+            <button type="button" onClick={selectCurrentView}>Use current view</button>
+          </div>
+        )}
 
         {showSurveyPicker && surveyPreferenceReady && (
           <section className={styles.surveyPicker} aria-label="Choose a sky survey">
@@ -690,18 +1098,7 @@ export default function SkyViewport({
             <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.8" /><path d="M3.7 10h12.6M10 3.2v13.6M5.1 5.3c2.9 2 6.9 2 9.8 0M5.1 14.7c2.9-2 6.9-2 9.8 0" /></svg>
           </button>
           <span className={styles.dockDivider} aria-hidden="true" />
-          <button
-            className={showLocalStarfield ? styles.controlActive : ""}
-            type="button"
-            aria-label={showLocalStarfield ? "Local starfield active" : "Use local starfield fallback"}
-            aria-pressed={showLocalStarfield}
-            title={mapStatus === "fallback" ? "Survey atlas unavailable; local starfield active" : showLocalStarfield ? "Return to live sky survey" : "Use local starfield fallback"}
-            disabled={mapStatus === "fallback"}
-            onClick={() => setLocalStarfieldRequested((isRequested) => !isRequested)}
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2.8 1.45 4.25 4.25 1.45-4.25 1.45L10 14.2l-1.45-4.25L4.3 8.5l4.25-1.45L10 2.8Z" /><path d="m15.6 12.4.7 2.05 2.05.7-2.05.7-.7 2.05-.7-2.05-2.05-.7 2.05-.7.7-2.05Z" /></svg>
-          </button>
-          <button type="button" aria-label="Return to SPHEREx demo field" title="Return to demo field" onClick={resetView}>
+          <button type="button" aria-label="Return to the demo field" title="Return to demo field" onClick={resetView}>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 1 0 1.7-4.2L4 7.5M4 4v3.5h3.5" /></svg>
           </button>
         </nav>
@@ -737,25 +1134,35 @@ export default function SkyViewport({
           <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4 2h6v6M10 2 5 7M9 7v3H2V3h3" /></svg>
         </a>
 
-        {mapStatus === "loading" && !showLocalStarfield && (
+        {mapStatus === "loading" && (
           <div className={styles.mapStatus} role="status" aria-live="polite">
             <span className={styles.spinner} aria-hidden="true" />
             <span>Opening the sky atlas…</span>
           </div>
         )}
-        {showLocalStarfield && (
-          <div className={styles.fallbackMessage} role="status">
-            <p className={styles.panelEyebrow}>LOCAL SKY VIEW</p>
-            <strong>{mapStatus === "fallback" ? "Survey atlas unavailable" : "Local starfield preview"}</strong>
-            <span>{mapStatus === "fallback" ? "The live survey could not start. The SPHEREx comparison remains available; reload to try the atlas again." : "Showing the cockpit’s local starfield. Return to the survey map to continue exploring."}</span>
-          </div>
-        )}
-
-        {mapStatus !== "loading" && activeFootprintIsDemo && visibleSelectedFootprintId && (
-          <SpherexComparison center={DEMO_CENTER} onClose={() => {
-            selectedFootprintIdRef.current = null;
-            setSelectedFootprintId(null);
-          }} />
+        {mapStatus !== "loading" && showArchiveExplorer && (
+          <ArchiveExplorer
+            key={mode + ":" + archiveObservations.map((observation) => observation.id).join("|")}
+            mode={mode}
+            region={selectedRegion}
+            observations={archiveObservations}
+            activeIndex={activeObservationIndex}
+            onActiveIndexChange={setActiveObservationIndex}
+            busy={archiveBusy}
+            statusMessage={archiveMessage}
+            isArchiveData={isArchiveData}
+            candidates={candidates}
+            candidateStoreReady={candidateStoreReady}
+            candidatePosition={candidatePosition}
+            currentCenter={view.center}
+            onCandidatePositionChange={updateCandidatePosition}
+            onUseCurrentCenter={() => updateCandidatePosition(view.center)}
+            onCheckKnownObjects={checkKnownObjects}
+            onSaveCandidate={saveCandidate}
+            onExportCandidates={exportCandidates}
+            onSearch={() => selectedRegion && void searchArchive(mode, selectedRegion)}
+            onClose={closeArchivePanel}
+          />
         )}
 
         <span className={styles.srOnly} role="status">

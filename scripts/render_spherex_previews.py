@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render two aligned, false-color previews from the supplied SPHEREx FITS files.
+"""Render an aligned browser preview from a SPHEREx or WISE FITS image.
 
 The source FITS files remain untouched. This script reads each IMAGE HDU, applies
 its TAN-SIP WCS, reprojects the same 0.70 x 0.525 degree sky patch, and writes
@@ -20,7 +20,17 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = (
     ("level2_2025W18_2B_0237_4D1_spx_l2b-v20-2025-241.fits", "spherex-qr2-d1-2025-05-03.png"),
+    ("level2_2025W19_2B_0425_1D1_spx_l2b-v20-2025-247.fits", "spherex-qr2-d1-2025-05-11.png"),
+    ("level2_2025W20_2D_0584_4D1_spx_l2b-v20-2025-247.fits", "spherex-qr2-d1-2025-05-18.png"),
     ("level2_2025W21_1B_0582_2D1_spx_l2b-v20-2025-248.fits", "spherex-qr2-d1-2025-05-22.png"),
+    ("level2_2025W22_1B_0052_1D1_spx_l2b-v20-2025-250.fits", "spherex-qr2-d1-2025-05-26.png"),
+    ("level2_2025W44_2B_0841_4D1_spx_l2b-v20-2025-307.fits", "spherex-qr2-d1-2025-11-02.png"),
+    ("level2_2025W45_1A_0137_1D1_spx_l2b-v20-2025-311.fits", "spherex-qr2-d1-2025-11-03.png"),
+    ("level2_2025W45_1A_0137_2D1_spx_l2b-v20-2025-311.fits", "spherex-qr2-d1-2025-11-03-1514.png"),
+    ("level2_2025W45_1A_0137_3D1_spx_l2b-v20-2025-311.fits", "spherex-qr2-d1-2025-11-03-1516.png"),
+    ("level2_2025W48_2A_0059_1D1_spx_l2b-v20-2025-337.fits", "spherex-qr2-d1-2025-11-27.png"),
+    ("level2_2025W49_1A_0450_1D1_spx_l2b-v20-2025-339.fits", "spherex-qr2-d1-2025-12-03.png"),
+    ("level2_2026W21_1A_0480_1D1_spx_l2b-v25-2026-146.fits", "spherex-qr2-d1-2026-05-21.png"),
 )
 CENTER_RA_DEG = 127.69444
 CENTER_DEC_DEG = -39.17760
@@ -101,7 +111,7 @@ def read_science_image(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
             data_offset = handle.tell()
             naxis = int(header.get("NAXIS", 0))
             extension = str(header.get("EXTNAME", "")).strip().upper()
-            if extension == "IMAGE" and naxis == 2:
+            if naxis == 2 and (extension == "IMAGE" or not extension):
                 bitpix = int(header["BITPIX"])
                 dtype = {8: ">u1", 16: ">i2", 32: ">i4", 64: ">i8", -32: ">f4", -64: ">f8"}[bitpix]
                 shape = (int(header["NAXIS2"]), int(header["NAXIS1"]))
@@ -112,6 +122,8 @@ def read_science_image(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
 
             data_size = data_size_bytes(header)
             handle.seek(data_offset + ((data_size + 2879) // 2880) * 2880)
+            if handle.tell() >= path.stat().st_size:
+                raise ValueError("No two-dimensional IMAGE extension was found in the FITS file")
 
 
 def polynomial(header: dict[str, Any], prefix: str, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -153,13 +165,20 @@ def sample_reprojected(image: np.ndarray, header: dict[str, Any], xi: np.ndarray
     plane_x = np.rad2deg(cos_dec * np.sin(delta_ra) / denominator)
     plane_y = np.rad2deg((np.cos(image_dec) * np.sin(sky_dec) - np.sin(image_dec) * cos_dec * np.cos(delta_ra)) / denominator)
 
-    cd = np.array(
-        [
-            [float(header["CDELT1"]) * float(header["PC1_1"]), float(header["CDELT1"]) * float(header["PC1_2"])],
-            [float(header["CDELT2"]) * float(header["PC2_1"]), float(header["CDELT2"]) * float(header["PC2_2"])],
-        ],
-        dtype=np.float64,
-    )
+    if all(key in header for key in ("CD1_1", "CD1_2", "CD2_1", "CD2_2")):
+        cd = np.array(
+            [[float(header["CD1_1"]), float(header["CD1_2"])],
+             [float(header["CD2_1"]), float(header["CD2_2"])]],
+            dtype=np.float64,
+        )
+    else:
+        cd = np.array(
+            [
+                [float(header["CDELT1"]) * float(header.get("PC1_1", 1.0)), float(header["CDELT1"]) * float(header.get("PC1_2", 0.0))],
+                [float(header["CDELT2"]) * float(header.get("PC2_1", 0.0)), float(header["CDELT2"]) * float(header.get("PC2_2", 1.0))],
+            ],
+            dtype=np.float64,
+        )
     inverse_cd = np.linalg.inv(cd)
     distorted_x = inverse_cd[0, 0] * plane_x + inverse_cd[0, 1] * plane_y
     distorted_y = inverse_cd[1, 0] * plane_x + inverse_cd[1, 1] * plane_y
@@ -214,19 +233,49 @@ def false_color(sample: np.ndarray, low: float, high: float) -> np.ndarray:
 
 
 def main() -> None:
+    global CENTER_RA_DEG, CENTER_DEC_DEG, WIDTH, HEIGHT, FIELD_OF_VIEW_DEG
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data" / "spherex-demo")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "public" / "spherex-previews")
+    parser.add_argument("--input-fits", type=Path)
+    parser.add_argument("--output-file", type=Path)
+    parser.add_argument("--center-ra", type=float, default=CENTER_RA_DEG)
+    parser.add_argument("--center-dec", type=float, default=CENTER_DEC_DEG)
+    parser.add_argument("--fov-width", type=float, default=FIELD_OF_VIEW_DEG)
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
     args = parser.parse_args()
 
+    CENTER_RA_DEG = args.center_ra
+    CENTER_DEC_DEG = args.center_dec
+    WIDTH = max(64, min(1600, args.width))
+    HEIGHT = max(64, min(1200, args.height))
+    FIELD_OF_VIEW_DEG = max(0.01, min(3.0, args.fov_width))
     xi, eta = output_grid()
+    if args.input_fits:
+        if not args.output_file:
+            parser.error("--output-file is required with --input-fits")
+        image, header = read_science_image(args.input_fits)
+        sample = sample_reprojected(image, header, xi, eta)
+        finite = sample[np.isfinite(sample)]
+        if finite.size == 0:
+            raise ValueError("The selected region does not overlap valid image pixels")
+        low, high = np.percentile(finite, [0.5, 99.5])
+        pixels = false_color(sample, float(low), float(high))
+        args.output_file.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(pixels, mode="RGB").save(args.output_file, format="PNG", optimize=True)
+        return
+
     samples: list[tuple[np.ndarray, str]] = []
     for source_name, output_name in SAMPLES:
         source_path = args.data_dir / source_name
         if not source_path.is_file():
-            raise FileNotFoundError(f"Missing SPHEREx FITS source: {source_path}")
+            continue
         image, header = read_science_image(source_path)
         samples.append((sample_reprojected(image, header, xi, eta), output_name))
+
+    if not samples:
+        raise FileNotFoundError(f"No configured SPHEREx FITS sources found in {args.data_dir}")
 
     finite_chunks = [sample[np.isfinite(sample)] for sample, _ in samples]
     finite_values = np.concatenate(finite_chunks)

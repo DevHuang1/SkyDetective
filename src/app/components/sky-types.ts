@@ -7,6 +7,7 @@ export type SkyFootprint = {
   id: string;
   vertices: readonly SkyCoordinate[];
   selected?: boolean;
+  kind?: "region" | "observation" | "demo";
 };
 
 export type SkyViewState = {

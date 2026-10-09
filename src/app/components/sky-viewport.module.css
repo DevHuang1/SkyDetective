@@ -250,8 +250,7 @@
 .coordinateRows,
 .pickerNote,
 .navigationHint,
-.attribution,
-.fallbackMessage {
+.attribution {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -715,39 +714,6 @@
   to { transform: rotate(360deg); }
 }
 
-.fallbackMessage {
-  position: absolute;
-  z-index: 6;
-  top: 50%;
-  left: 50%;
-  display: grid;
-  width: min(320px, calc(100vw - 34px));
-  gap: 8px;
-  padding: 16px;
-  color: #c4d3dd;
-  text-align: center;
-  background: rgba(5, 15, 26, 0.86);
-  border: 1px solid rgba(126, 174, 194, 0.22);
-  border-radius: 11px;
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
-  transform: translate(-50%, -50%);
-  backdrop-filter: blur(14px);
-}
-
-.fallbackMessage strong {
-  color: #e8f3f8;
-  font-family: Arial, Helvetica, sans-serif;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.fallbackMessage > span {
-  color: #a4b8c5;
-  font-family: Arial, Helvetica, sans-serif;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
 .srOnly {
   position: absolute;
   width: 1px;
@@ -984,5 +950,184 @@
 
   .compareButton {
     transition: none;
+  }
+}
+
+.modeSwitch {
+  display: inline-flex;
+  padding: 3px;
+  background: rgba(4, 13, 24, 0.82);
+  border: 1px solid rgba(122, 172, 193, 0.22);
+  border-radius: 9px;
+  box-shadow: 0 9px 24px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(12px);
+  pointer-events: auto;
+}
+
+.modeSwitch button {
+  min-height: 34px;
+  padding: 0 9px;
+  color: #9fb5c2;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 9px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.modeSwitch button:hover,
+.modeSwitch button:focus-visible {
+  color: #effaff;
+  outline: 1px solid rgba(117, 208, 230, 0.42);
+}
+
+.modeSwitch .modeActive {
+  color: #e8fbff;
+  background: rgba(27, 94, 122, 0.65);
+  border-color: rgba(105, 205, 228, 0.28);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.selectAreaButton,
+.selectAreaActive {
+  min-height: 43px;
+  padding: 0 12px;
+  color: #eaf7fb;
+  background: rgba(13, 40, 55, 0.9);
+  border: 1px solid rgba(122, 187, 204, 0.32);
+  border-radius: 9px;
+  font-size: 9px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.selectAreaActive {
+  color: #ffe2a9;
+  background: rgba(94, 64, 27, 0.92);
+  border-color: rgba(240, 184, 93, 0.66);
+}
+
+.selectAreaButton:disabled,
+.selectAreaActive:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.selectionBox {
+  position: absolute;
+  z-index: 5;
+  border: 1px solid rgba(255, 219, 153, 0.98);
+  background: rgba(240, 179, 95, 0.12);
+  box-shadow: 0 0 0 1px rgba(5, 13, 19, 0.6), 0 0 20px rgba(255, 196, 105, 0.16);
+  pointer-events: none;
+}
+
+.selectionHint {
+  position: absolute;
+  z-index: 8;
+  top: 91px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  color: #e3edf0;
+  background: rgba(4, 13, 23, 0.88);
+  border: 1px solid rgba(210, 169, 105, 0.34);
+  border-radius: 9px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  font-size: 9px;
+  transform: translateX(-50%);
+  backdrop-filter: blur(14px);
+  pointer-events: auto;
+}
+
+.selectionHint strong {
+  color: #ffd596;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
+.selectionHint span {
+  color: #b4c4ca;
+  white-space: nowrap;
+}
+
+.selectionHint button {
+  padding: 5px 7px;
+  color: #f6e5c5;
+  background: rgba(134, 91, 37, 0.3);
+  border: 1px solid rgba(230, 179, 93, 0.34);
+  border-radius: 5px;
+  font-size: 8px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.selectionHint button:hover,
+.selectionHint button:focus-visible {
+  background: rgba(160, 111, 47, 0.45);
+  outline: 1px solid rgba(255, 213, 145, 0.58);
+}
+
+@media (max-width: 1000px) {
+  .topBar {
+    align-items: flex-start;
+  }
+
+  .topActions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+    max-width: 76%;
+  }
+
+  .surveySelect {
+    min-width: 145px;
+    padding: 6px 8px;
+  }
+
+  .surveySelect > span { font-size: 6px; }
+  .surveySelect select { font-size: 9px; }
+  .selectAreaButton,
+  .selectAreaActive { min-height: 38px; padding: 0 9px; }
+}
+
+@media (max-width: 760px) {
+  .topBar {
+    top: 12px;
+    right: 14px;
+    left: 14px;
+    gap: 8px;
+  }
+
+  .topActions {
+    max-width: calc(100% - 125px);
+  }
+
+  .modeSwitch button {
+    min-height: 28px;
+    padding: 0 6px;
+    font-size: 8px;
+  }
+
+  .surveySelect { display: none; }
+  .compareButton { display: none; }
+  .selectAreaButton,
+  .selectAreaActive {
+    min-height: 34px;
+    padding: 0 8px;
+    font-size: 8px;
+  }
+
+  .selectionHint {
+    top: 66px;
+    width: calc(100% - 28px);
+    justify-content: center;
+    flex-wrap: wrap;
   }
 }
