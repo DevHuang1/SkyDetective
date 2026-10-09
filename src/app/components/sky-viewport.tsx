@@ -973,7 +973,7 @@ export default function SkyViewport({
             </span>
             <div>
               <p className={styles.kicker}>FLIGHT DECK · DEEP SKY</p>
-              <h1>SkyDetective</h1>
+              <h1>SpaceDetective</h1>
             </div>
           </div>
 

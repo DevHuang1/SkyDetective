@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SkyDetective — SPHEREx Sky Atlas",
+  title: "SpaceDetective — SPHEREx Sky Atlas",
   description:
     "Browse real sky surveys from a spaceship cockpit and compare SPHEREx observations across dates.",
 };
