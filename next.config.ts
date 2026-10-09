@@ -7,7 +7,8 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: __dirname,
     rules: {
-      "*.css": {
+      // Keep the Tailwind loader on global CSS; CSS Modules use Next's native pipeline.
+      "src/app/globals.css": {
         loaders: ["@tailwindcss/turbopack"],
         as: "*.css",
       },

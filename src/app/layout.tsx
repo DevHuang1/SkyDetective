@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SkyDetective — Celestial Cockpit",
+  title: "SkyDetective — SPHEREx Sky Atlas",
   description:
-    "Explore the celestial sphere from an immersive spaceship cockpit viewport.",
+    "Browse real sky surveys from a spaceship cockpit and compare SPHEREx observations across dates.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
